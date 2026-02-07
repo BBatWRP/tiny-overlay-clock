@@ -43,4 +43,7 @@ g++ -o EdgeClock.exe EdgeClock.cpp -lgdi32 -luser32 -lgdiplus -mwindows -static
 
 ## License
 
-[MIT License](LICENSE)
+**PolyForm Noncommercial License 1.0.0**
+Free for personal and non-commercial use.
+**NOT FOR RESALE.**
+[View License](LICENSE)
