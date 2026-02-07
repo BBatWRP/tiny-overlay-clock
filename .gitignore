@@ -1,0 +1,16 @@
+# Build artifacts
+*.exe
+*.o
+*.obj
+*.pdb
+*.idb
+*.ilk
+*.suo
+*.tlog
+
+# VS Code
+.vscode/
+
+# System
+Thumbs.db
+Desktop.ini
