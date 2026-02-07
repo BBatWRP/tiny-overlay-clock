@@ -2,9 +2,6 @@
 
 A lightweight, unobtrusive digital clock for Windows designed to sit on the edge of your screen.
 
-![EdgeClock Screenshot](https://via.placeholder.com/600x400?text=EdgeClock+Screenshot) 
-*(You can replace this link with a real screenshot later)*
-
 ## Features
 
 *   **Edge-Clinging Design**: Sits neatly at the bottom-right of your screen (or wherever you position it).
@@ -18,7 +15,7 @@ A lightweight, unobtrusive digital clock for Windows designed to sit on the edge
 
 ## Installation & Usage
 
-1.  Download the latest `EdgeClock.exe` from the [Releases](link-to-releases) page (or build it yourself).
+1.  Download the latest `EdgeClock.exe` from the [Releases](https://github.com/BBatWRP/tiny-overlay-clock/releases) page (or build it yourself).
 2.  Run `EdgeClock.exe`.
 3.  **Right-click** on the clock or the system tray icon to access the menu:
     *   Change Size
