@@ -7,10 +7,11 @@ A lightweight, unobtrusive digital clock for Windows designed to sit on the edge
 *   **Edge-Clinging Design**: Sits neatly at the bottom-right of your screen (or wherever you position it).
 *   **Auto-Hide**: Automatically slides out of view when you hover over it or when other windows need the space (smart detection).
 *   **Efficiency Mode**: Automatically enters Windows "EcoQoS" mode to minimize battery and CPU usage.
-*   **Customizable**:
-    *   Adjust font size (Small, Normal, Large, or Custom).
-    *   Toggle "Run on Startup".
-    *   Manual Hide/Show.
+*   **Settings Dialog**: A comprehensive, modern UI to configure:
+    *   **Font**: Choose any installed font.
+    *   **Colors**: Custom Text and Outline colors.
+    *   **Animation**: Adjust slide speed/duration.
+    *   **Position**: Fine-tune X/Y offsets.
 *   **Lightweight**: Built with raw Win32 API and GDI+, ensuring minimal footprint (no heavy frameworks).
 
 ## Installation & Usage

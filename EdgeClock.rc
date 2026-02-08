@@ -1,0 +1,9 @@
+#include <windows.h>
+
+// Icon Resource
+// ID 101 - Main App Icon
+101 ICON "clock_23989.ico"
+
+// Manifest Resource
+// ID 1 - Standard Application Manifest
+1 24 "EdgeClock.exe.manifest"
