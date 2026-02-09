@@ -182,7 +182,7 @@ void UpdateLayeredWindowContent(HWND hwnd) {
     GetTime(timeBuf, 10);
 
     GraphicsPath path;
-    RectF rect(0, 0, (REAL)width, (REAL)height); 
+    RectF rect(0, 0, (REAL)width - (REAL)Config::outlineWidth, (REAL)height); 
     
     path.AddString(timeBuf, -1, &fontFamily, FontStyleBold, (REAL)Config::fontSize, rect, &format);
 
