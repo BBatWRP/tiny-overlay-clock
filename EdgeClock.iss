@@ -12,6 +12,7 @@ UninstallDisplayIcon={app}\EdgeClock.exe
 ; Require admin privileges for Program Files
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64
+DisableDirPage=no
 
 [Files]
 Source: "EdgeClock.exe"; DestDir: "{app}"; Flags: ignoreversion
