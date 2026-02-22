@@ -1,7 +1,7 @@
 @echo off
 echo Compiling EdgeClock...
 windres EdgeClock.rc -o resource.o
-g++ -o EdgeClock.exe EdgeClock.cpp resource.o -lgdi32 -luser32 -lgdiplus -lcomdlg32 -mwindows -ldwmapi -lcomctl32 -static
+g++ -o EdgeClock.exe EdgeClock.cpp resource.o -lgdi32 -luser32 -lgdiplus -lcomdlg32 -lole32 -luuid -mwindows -ldwmapi -lcomctl32 -static
 if %errorlevel% neq 0 (
     echo Compilation failed!
     pause

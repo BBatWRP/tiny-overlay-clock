@@ -14,3 +14,6 @@
 # System
 Thumbs.db
 Desktop.ini
+
+Output/
+*.o

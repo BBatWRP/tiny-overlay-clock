@@ -1,0 +1,30 @@
+[Setup]
+AppName=EdgeClock
+AppVersion=1.0.0.0
+DefaultDirName={pf}\EdgeClock
+DefaultGroupName=EdgeClock
+OutputDir=Output
+OutputBaseFilename=EdgeClockSetup_v1.0
+Compression=lzma2
+SolidCompression=yes
+SetupIconFile=clock_23989.ico
+UninstallDisplayIcon={app}\EdgeClock.exe
+; Require admin privileges for Program Files
+PrivilegesRequired=admin
+ArchitecturesInstallIn64BitMode=x64
+
+[Files]
+Source: "EdgeClock.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "clock_23989.ico"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{group}\EdgeClock"; Filename: "{app}\EdgeClock.exe"
+Name: "{group}\Uninstall EdgeClock"; Filename: "{uninstallexe}"
+Name: "{commondesktop}\EdgeClock"; Filename: "{app}\EdgeClock.exe"; Tasks: desktopicon
+; We don't explicitly need to create a Startup shortcut here since EdgeClock has a "Run on Startup" toggle in its own menu
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
+
+[Run]
+Filename: "{app}\EdgeClock.exe"; Description: "Launch EdgeClock"; Flags: nowait postinstall skipifsilent
