@@ -793,6 +793,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         SetTimer(hwnd, 1, 300, NULL);
         SetTimer(hwnd, 2, 1000, NULL);
+        
+        // Trim RAM after initialization
+        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
         return 0;
 
     case WM_DISPLAYCHANGE:
@@ -898,6 +901,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                if (_tcscmp(lastTime, curTime) != 0) {
                    _tcscpy(lastTime, curTime);
                    UpdateLayeredWindowContent(hwnd);
+                   // Trim RAM after drawing new minute
+                   SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
                }
             }
             return 0;
