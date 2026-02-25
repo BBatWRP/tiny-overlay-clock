@@ -122,4 +122,4 @@ Free for personal and non-commercial use.
 [View Full License](LICENSE)
 
 * **Concept & Development**: BBatWRP (Bat)
-* **AI Assistance**: Code architecture, modern UI refactoring, registry logic, and extreme performance optimization (EcoQoS & RAM Trimming) provided by **Google Gemini**.
+* **AI Assistance**: Code architecture, modern UI refactoring, registry logic, and extreme performance optimization (EcoQoS & RAM Trimming) provided by **Google Gemini** & Claude.

@@ -29,8 +29,18 @@ using namespace Gdiplus;
 // =============================================================
 //   CONFIGURATION
 // =============================================================
+static HANDLE g_hMutex = NULL; // Global mutex for single-instance
+
 void Log(const char* msg) {
-    FILE* f = fopen("EdgeClock_Log.txt", "a");
+    static char logPath[MAX_PATH] = {0};
+    if (!logPath[0]) {
+        // Resolve log path next to the exe, not relative to CWD
+        GetModuleFileNameA(NULL, logPath, MAX_PATH);
+        char* lastSlash = strrchr(logPath, '\\');
+        if (lastSlash) strcpy(lastSlash + 1, "EdgeClock_Log.txt");
+        else strcpy(logPath, "EdgeClock_Log.txt");
+    }
+    FILE* f = fopen(logPath, "a");
     if (f) {
         fprintf(f, "%s\n", msg);
         fclose(f);
@@ -61,9 +71,9 @@ namespace Config {
     float offsetY = 0.0f;
 
     // --- Menu Presets ---
-    const float sizeSmall = 10.0f;
-    const float sizeMedium = 16.0f;
-    const float sizeLarge = 24.0f;              
+    const float sizeSmall = 16.0f;
+    const float sizeMedium = 24.0f;
+    const float sizeLarge = 32.0f;              
 }
 
 
@@ -307,8 +317,6 @@ void InitTrayIcon(HWND hwnd) {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     
-    nid.uCallbackMessage = WM_TRAYICON;
-    
     // Load Icon from Resource (ID 101)
     nid.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(101));
     if (!nid.hIcon) {
@@ -326,11 +334,17 @@ void RemoveTrayIcon() {
 bool IsStartupEnabled() {
     HKEY hKey;
     if (RegOpenKeyEx(HKEY_CURRENT_USER, _T("Software\\Microsoft\\Windows\\CurrentVersion\\Run"), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        TCHAR path[MAX_PATH];
+        TCHAR path[MAX_PATH + 2];
         DWORD size = sizeof(path);
         if (RegQueryValueEx(hKey, _T("EdgeClock"), NULL, NULL, (LPBYTE)path, &size) == ERROR_SUCCESS) {
             RegCloseKey(hKey);
-            return true;
+            // Validate the stored path matches the current exe
+            TCHAR exePath[MAX_PATH];
+            GetModuleFileName(NULL, exePath, MAX_PATH);
+            TCHAR expected[MAX_PATH + 4];
+            _stprintf(expected, _T("\"%s\""), exePath);
+            // Match either quoted or unquoted (backward compat)
+            return (_tcsicmp(path, expected) == 0 || _tcsicmp(path, exePath) == 0);
         }
         RegCloseKey(hKey);
     }
@@ -343,7 +357,10 @@ void SetStartup(bool enable) {
         if (enable) {
             TCHAR path[MAX_PATH];
             GetModuleFileName(NULL, path, MAX_PATH);
-            RegSetValueEx(hKey, _T("EdgeClock"), 0, REG_SZ, (LPBYTE)path, (lstrlen(path) + 1) * sizeof(TCHAR));
+            // Wrap in quotes so paths with spaces work correctly
+            TCHAR quoted[MAX_PATH + 4];
+            _stprintf(quoted, _T("\"%s\""), path);
+            RegSetValueEx(hKey, _T("EdgeClock"), 0, REG_SZ, (LPBYTE)quoted, (lstrlen(quoted) + 1) * sizeof(TCHAR));
         } else {
             RegDeleteValue(hKey, _T("EdgeClock"));
         }
@@ -739,9 +756,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             break;
         }
         case WM_CLOSE:
-            if (hBrushDark) DeleteObject(hBrushDark);
-            if (hBrushEdit) DeleteObject(hBrushEdit);
-            if (hFontSegoe) DeleteObject(hFontSegoe);
+            if (hBrushDark) { DeleteObject(hBrushDark); hBrushDark = NULL; }
+            if (hBrushEdit) { DeleteObject(hBrushEdit); hBrushEdit = NULL; }
+            if (hFontSegoe) { DeleteObject(hFontSegoe); hFontSegoe = NULL; }
             DestroyWindow(hwnd);
             break;
     }
@@ -755,7 +772,7 @@ void DoSettingsDialog(HWND parent) {
         wc.lpfnWndProc = SettingsWndProc;
         wc.hInstance = GetModuleHandle(NULL);
         wc.lpszClassName = CLASS_NAME;
-        wc.hbrBackground = (HBRUSH)CreateSolidBrush(RGB(32, 32, 32)); // Dark Background
+        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); // Stock brush, no leak
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
         RegisterClass(&wc);
     }
@@ -821,14 +838,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 break;
             case ID_SIZE_SMALL:
                 Config::fontSize = Config::sizeSmall;
+                SaveConfig();
                 RecalculateAll(hwnd);
                 break;
             case ID_SIZE_MEDIUM:
                 Config::fontSize = Config::sizeMedium;
+                SaveConfig();
                 RecalculateAll(hwnd);
                 break;
             case ID_SIZE_LARGE:
                 Config::fontSize = Config::sizeLarge;
+                SaveConfig();
                 RecalculateAll(hwnd);
                 break;
             // Case ID_SIZE_CUSTOM removed
@@ -963,6 +983,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
+    case WM_ENDSESSION:
+        // Graceful cleanup when Windows shuts down or user logs off
+        if (wParam) {
+            SaveConfig();
+            RemoveTrayIcon();
+        }
+        return 0;
+
     case WM_DESTROY:
         RemoveTrayIcon();
         GdiplusShutdown(gdiplusToken);
@@ -1021,9 +1049,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     Log("Starting EdgeClock...");
     
     // --- Single Instance Check ---
-    HANDLE hMutex = CreateMutex(NULL, TRUE, _T("EdgeClock_GlobalInstance_Mutex"));
+    g_hMutex = CreateMutex(NULL, TRUE, _T("EdgeClock_GlobalInstance_Mutex"));
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         Log("EdgeClock is already running. Exiting redundant instance.");
+        if (g_hMutex) { CloseHandle(g_hMutex); g_hMutex = NULL; }
         
         // Find the existing window and bring it to the front if it's hidden behind something
         HWND hExisting = FindWindowEx(NULL, NULL, _T("EdgeClockTray"), _T("Edge Clock"));
@@ -1085,5 +1114,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         DispatchMessage(&msg);
     }
     CoUninitialize();
+    if (g_hMutex) { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); g_hMutex = NULL; }
     return 0;
 }
