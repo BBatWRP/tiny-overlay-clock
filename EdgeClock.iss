@@ -26,6 +26,10 @@ Name: "{commondesktop}\EdgeClock"; Filename: "{app}\EdgeClock.exe"; Tasks: deskt
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
+Name: "startup"; Description: "Run on startup"; GroupDescription: "Additional tasks:"; Flags: checkedonce
+
+[Registry]
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "EdgeClock"; ValueData: """{app}\EdgeClock.exe"""; Flags: uninsdeletevalue; Tasks: startup
 
 [Run]
-Filename: "{app}\EdgeClock.exe"; Description: "Launch EdgeClock"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\EdgeClock.exe"; Description: "Launch EdgeClock"; Flags: nowait postinstall skipifsilent runasoriginaluser

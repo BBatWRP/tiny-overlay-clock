@@ -334,17 +334,19 @@ void RemoveTrayIcon() {
 bool IsStartupEnabled() {
     HKEY hKey;
     if (RegOpenKeyEx(HKEY_CURRENT_USER, _T("Software\\Microsoft\\Windows\\CurrentVersion\\Run"), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        TCHAR path[MAX_PATH + 2];
+        TCHAR path[MAX_PATH * 2] = {0}; // Ensure buffer is fully zeroed
         DWORD size = sizeof(path);
         if (RegQueryValueEx(hKey, _T("EdgeClock"), NULL, NULL, (LPBYTE)path, &size) == ERROR_SUCCESS) {
             RegCloseKey(hKey);
-            // Validate the stored path matches the current exe
             TCHAR exePath[MAX_PATH];
             GetModuleFileName(NULL, exePath, MAX_PATH);
-            TCHAR expected[MAX_PATH + 4];
-            _stprintf(expected, _T("\"%s\""), exePath);
-            // Match either quoted or unquoted (backward compat)
-            return (_tcsicmp(path, expected) == 0 || _tcsicmp(path, exePath) == 0);
+            
+            // Check if the registry path matches our executable path
+            // The registry path might be quoted, so we check both quoted and unquoted versions
+            TCHAR expectedQuoted[MAX_PATH + 4];
+            _stprintf(expectedQuoted, _T("\"%s\""), exePath);
+            
+            return (_tcsicmp(path, expectedQuoted) == 0 || _tcsicmp(path, exePath) == 0);
         }
         RegCloseKey(hKey);
     }
@@ -357,9 +359,12 @@ void SetStartup(bool enable) {
         if (enable) {
             TCHAR path[MAX_PATH];
             GetModuleFileName(NULL, path, MAX_PATH);
+            
             // Wrap in quotes so paths with spaces work correctly
             TCHAR quoted[MAX_PATH + 4];
             _stprintf(quoted, _T("\"%s\""), path);
+            
+            // Write to registry
             RegSetValueEx(hKey, _T("EdgeClock"), 0, REG_SZ, (LPBYTE)quoted, (lstrlen(quoted) + 1) * sizeof(TCHAR));
         } else {
             RegDeleteValue(hKey, _T("EdgeClock"));
