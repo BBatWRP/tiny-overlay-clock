@@ -1,6 +1,8 @@
 [Setup]
-; Stable AppId so every future version upgrades in place (never change this GUID)
-AppId={{8F4E3A1B-2C5D-4E6F-9A7B-1D2E3F4A5B6C}
+; Stable AppId so every future version upgrades in place. Must stay
+; "EdgeClock" — older installers omitted AppId, which defaults to AppName,
+; so this keeps upgrades replacing existing installs instead of duplicating.
+AppId=EdgeClock
 AppName=EdgeClock
 AppVersion=1.5.0.0
 ; Detect the app's single-instance mutex: installer asks the user to close
