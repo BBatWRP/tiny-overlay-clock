@@ -66,9 +66,13 @@ namespace Config {
     
     // --- Auto-Hide Logic ---
     // Thresholds for determining when to hide the clock.
-    int taskbarThreshold = 4;     
-    float offsetX = 0.0f;              
+    int taskbarThreshold = 4;
+    float offsetX = 0.0f;
     float offsetY = 0.0f;
+
+    // --- Clock Text ---
+    WCHAR timeFormat[32] = L"%H:%M"; // strftime format (e.g. %H:%M:%S, %I:%M %p, %a %d %H:%M)
+    int opacity = 100;               // Clock opacity in percent (20-100)
 
     // --- Menu Presets ---
     const float sizeSmall = 16.0f;
@@ -90,8 +94,26 @@ void SaveConfig() {
         RegSetValueEx(hKey, _T("TextColor"), 0, REG_DWORD, (const BYTE*)&Config::textColor, sizeof(COLORREF));
         RegSetValueEx(hKey, _T("OutlineColor"), 0, REG_DWORD, (const BYTE*)&Config::outlineColor, sizeof(COLORREF));
         RegSetValueEx(hKey, _T("FontName"), 0, REG_SZ, (const BYTE*)Config::fontName, (lstrlenW(Config::fontName) + 1) * sizeof(WCHAR));
+        RegSetValueEx(hKey, _T("TimeFormat"), 0, REG_SZ, (const BYTE*)Config::timeFormat, (lstrlenW(Config::timeFormat) + 1) * sizeof(WCHAR));
+        RegSetValueEx(hKey, _T("Opacity"), 0, REG_DWORD, (const BYTE*)&Config::opacity, sizeof(int));
         RegCloseKey(hKey);
     }
+}
+
+// Validates a strftime format string: every '%' must be followed by a
+// known specifier. Prevents msvcrt's invalid-parameter handler from
+// aborting on garbage formats.
+bool IsValidTimeFormat(const WCHAR* f) {
+    if (!f || !*f) return false;
+    const WCHAR* allowed = L"aAbBcdHIjmMpSUwWxXyYzZ%";
+    for (const WCHAR* p = f; *p; ++p) {
+        if (*p == L'%') {
+            ++p;
+            if (*p == L'#') ++p; // msvcrt's no-leading-zero flag (e.g. %#I)
+            if (!*p || !wcschr(allowed, *p)) return false;
+        }
+    }
+    return true;
 }
 
 void LoadConfig() {
@@ -116,14 +138,23 @@ void LoadConfig() {
         if (RegQueryValueEx(hKey, _T("FontName"), NULL, NULL, (LPBYTE)Config::fontName, &currentSize) == ERROR_SUCCESS) {
              Config::fontName[31] = L'\0'; // Safety null-terminate
         }
-        
+
+        DWORD fmtSize = sizeof(Config::timeFormat);
+        if (RegQueryValueEx(hKey, _T("TimeFormat"), NULL, NULL, (LPBYTE)Config::timeFormat, &fmtSize) == ERROR_SUCCESS) {
+             Config::timeFormat[31] = L'\0';
+        }
+        RegQueryValueEx(hKey, _T("Opacity"), NULL, NULL, (LPBYTE)&Config::opacity, &sizeInt);
+
         RegCloseKey(hKey);
     }
-    
+
     // Safety Checks
     if (Config::fontSize < 4.0f) Config::fontSize = 14.0f;
     if (Config::fontSize > 200.0f) Config::fontSize = 72.0f;
     if (Config::animDuration < 0) Config::animDuration = 500;
+    if (Config::opacity < 20) Config::opacity = 20;
+    if (Config::opacity > 100) Config::opacity = 100;
+    if (!IsValidTimeFormat(Config::timeFormat)) lstrcpyW(Config::timeFormat, L"%H:%M");
     Log("Config Loaded.");
 }
 // =============================================================
@@ -154,6 +185,9 @@ void LoadConfig() {
 #define ID_TRACK_ANIM_SPEED 3012
 #define ID_STATIC_DURATION_VAL 3013
 #define ID_BTN_RESET 3014
+#define ID_EDIT_TIME_FORMAT 3015
+#define ID_TRACK_OPACITY 3016
+#define ID_STATIC_OPACITY_VAL 3017
 
 enum AnimState {
     STATE_VISIBLE,
@@ -166,20 +200,50 @@ AnimState currentState = STATE_SLIDING_UP;
 // Floating point state for precise animation
 float currentYVal = 0.0f;
 int targetY = 0;
+// Bottom-right corner (absolute virtual-screen coords) of the target monitor
 int screenH = 0;
 int screenW = 0;
 SIZE clockSize = {0, 0};
 bool manualHidden = false;
 
+// Time-based animation state (immune to timer jitter under IDLE priority)
+ULONGLONG animStartTick = 0;
+float animStartY = 0.0f;
+
+UINT g_msgTaskbarCreated = 0; // "TaskbarCreated" broadcast (Explorer restart)
+
 ULONG_PTR gdiplusToken;
 NOTIFYICONDATA nid = { 0 };
+
+// Resolve the monitor that hosts the taskbar (falls back to primary) and
+// cache its absolute right/bottom edge for clock positioning.
+void UpdateScreenMetrics() {
+    HWND hTray = FindWindow(_T("Shell_TrayWnd"), NULL);
+    HMONITOR hMon;
+    if (hTray) {
+        hMon = MonitorFromWindow(hTray, MONITOR_DEFAULTTOPRIMARY);
+    } else {
+        POINT pt = {0, 0};
+        hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+    }
+    MONITORINFO mi = { sizeof(mi) };
+    if (GetMonitorInfo(hMon, &mi)) {
+        screenW = mi.rcMonitor.right;
+        screenH = mi.rcMonitor.bottom;
+    } else {
+        screenW = GetSystemMetrics(SM_CXSCREEN);
+        screenH = GetSystemMetrics(SM_CYSCREEN);
+    }
+}
 
 void GetTime(TCHAR* buffer, int size) {
     time_t rawtime;
     struct tm * timeinfo;
     time(&rawtime);
     timeinfo = localtime(&rawtime);
-    _tcsftime(buffer, size, _T("%H:%M"), timeinfo);
+    if (_tcsftime(buffer, size, Config::timeFormat, timeinfo) == 0) {
+        _tcsftime(buffer, size, _T("%H:%M"), timeinfo); // Fallback on bad format
+    }
 }
 
 void UpdateLayeredWindowContent(HWND hwnd) {
@@ -214,15 +278,13 @@ void UpdateLayeredWindowContent(HWND hwnd) {
         }
     }
 
-    Font font(pFamily, (REAL)Config::fontSize, FontStyleBold, UnitPoint);
-    
     // Use GenericTypographic to eliminate inner padding for strict alignment
     StringFormat format(StringFormat::GenericTypographic());
     format.SetAlignment(StringAlignmentFar);
     format.SetLineAlignment(StringAlignmentFar);
 
-    TCHAR timeBuf[10];
-    GetTime(timeBuf, 10);
+    TCHAR timeBuf[64];
+    GetTime(timeBuf, 64);
 
     GraphicsPath path;
     RectF rect(0, 0, (REAL)width - (REAL)Config::outlineWidth, (REAL)height); 
@@ -242,7 +304,7 @@ void UpdateLayeredWindowContent(HWND hwnd) {
     SIZE size = { width, height };
     BLENDFUNCTION blend = { 0 };
     blend.BlendOp = AC_SRC_OVER;
-    blend.SourceConstantAlpha = 255;
+    blend.SourceConstantAlpha = (BYTE)(Config::opacity * 255 / 100);
     blend.AlphaFormat = AC_SRC_ALPHA;
 
     UpdateLayeredWindow(hwnd, hdcScreen, NULL, &size, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
@@ -271,9 +333,9 @@ SIZE CalculateTextSize() {
     }
 
     Font font(pFamily, (REAL)Config::fontSize, FontStyleBold, UnitPoint);
-    
-    TCHAR timeBuf[10];
-    GetTime(timeBuf, 10);
+
+    TCHAR timeBuf[64];
+    GetTime(timeBuf, 64);
 
     RectF boundingBox(0,0,0,0);
     PointF origin(0, 0);
@@ -338,15 +400,18 @@ bool IsStartupEnabled() {
         DWORD size = sizeof(path);
         if (RegQueryValueEx(hKey, _T("EdgeClock"), NULL, NULL, (LPBYTE)path, &size) == ERROR_SUCCESS) {
             RegCloseKey(hKey);
-            TCHAR exePath[MAX_PATH];
-            GetModuleFileName(NULL, exePath, MAX_PATH);
             
-            // Check if the registry path matches our executable path
-            // The registry path might be quoted, so we check both quoted and unquoted versions
-            TCHAR expectedQuoted[MAX_PATH + 4];
-            _stprintf(expectedQuoted, _T("\"%s\""), exePath);
+            // Convert to lowercase for case-insensitive comparison
+            TCHAR lowerPath[MAX_PATH * 2];
+            _tcscpy(lowerPath, path);
+            _tcslwr(lowerPath);
             
-            return (_tcsicmp(path, expectedQuoted) == 0 || _tcsicmp(path, exePath) == 0);
+            // Check if it contains the executable name
+            if (_tcsstr(lowerPath, _T("edgeclock.exe")) != NULL) {
+                return true;
+            } else {
+                return false;
+            }
         }
         RegCloseKey(hKey);
     }
@@ -360,16 +425,29 @@ void SetStartup(bool enable) {
             TCHAR path[MAX_PATH];
             GetModuleFileName(NULL, path, MAX_PATH);
             
-            // Wrap in quotes so paths with spaces work correctly
+            // Wrap in quotes so paths with spaces work correctly using concatenation
+            // This avoids formatting bugs with _stprintf and %s on wide strings
             TCHAR quoted[MAX_PATH + 4];
-            _stprintf(quoted, _T("\"%s\""), path);
+            _tcscpy(quoted, _T("\""));
+            _tcscat(quoted, path);
+            _tcscat(quoted, _T("\""));
             
             // Write to registry
-            RegSetValueEx(hKey, _T("EdgeClock"), 0, REG_SZ, (LPBYTE)quoted, (lstrlen(quoted) + 1) * sizeof(TCHAR));
+            if (RegSetValueEx(hKey, _T("EdgeClock"), 0, REG_SZ, (LPBYTE)quoted, (lstrlen(quoted) + 1) * sizeof(TCHAR)) == ERROR_SUCCESS) {
+                Log("Startup Registry Key created/updated successfully.");
+            } else {
+                Log("ERROR: Failed to write Startup Registry Key.");
+            }
         } else {
-            RegDeleteValue(hKey, _T("EdgeClock"));
+            if (RegDeleteValue(hKey, _T("EdgeClock")) == ERROR_SUCCESS) {
+                Log("Startup Registry Key deleted successfully.");
+            } else {
+                Log("ERROR: Failed to delete Startup Registry Key.");
+            }
         }
         RegCloseKey(hKey);
+    } else {
+        Log("ERROR: Failed to open Startup Registry Key for writing.");
     }
 }
 
@@ -397,40 +475,85 @@ void ShowContextMenu(HWND hwnd) {
     DestroyMenu(hMenu);
 }
 
-void CreateStartMenuShortcut() {
-    TCHAR exePath[MAX_PATH];
-    if (GetModuleFileName(NULL, exePath, MAX_PATH) == 0) return;
-
-    TCHAR startMenuPath[MAX_PATH];
-    if (SUCCEEDED(SHGetFolderPath(NULL, CSIDL_PROGRAMS, NULL, 0, startMenuPath))) {
-        TCHAR shortcutPath[MAX_PATH];
-        _tcscpy(shortcutPath, startMenuPath);
-        _tcscat(shortcutPath, _T("\\EdgeClock.lnk"));
-
-        if (GetFileAttributes(shortcutPath) == INVALID_FILE_ATTRIBUTES) {
-            IShellLink* psl;
-            HRESULT hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLink, (LPVOID*)&psl);
-            if (SUCCEEDED(hr)) {
-                psl->SetPath(exePath);
-                psl->SetDescription(_T("EdgeClock"));
-
-                IPersistFile* ppf;
-                hr = psl->QueryInterface(IID_IPersistFile, (LPVOID*)&ppf);
-                if (SUCCEEDED(hr)) {
-                    ppf->Save(shortcutPath, TRUE);
-                    ppf->Release();
-                }
-                psl->Release();
-            }
-        }
-    }
-}
+// Start Menu shortcut creation removed — the Inno Setup installer owns
+// shortcut management, so a user-deleted shortcut stays deleted.
 
 // ... Settings Window Logic ...
 COLORREF tempTextColor;
 COLORREF tempOutlineColor;
 WCHAR tempFontName[32];
 HWND hColorBtn1, hColorBtn2;
+
+// Snapshot of live config taken when the dialog opens, restored on Cancel.
+// Enables live preview: every control change applies to Config immediately.
+struct ConfigSnapshot {
+    float fontSize, outlineWidth, offsetX, offsetY;
+    int animDuration, opacity;
+    COLORREF textColor, outlineColor;
+    WCHAR fontName[32];
+    WCHAR timeFormat[32];
+} g_cfgSnapshot;
+bool g_settingsReady = false; // Suppress preview during WM_CREATE init
+bool g_settingsOpen = false;  // Re-entry guard (tray clicks reach the disabled parent)
+
+void RecalculateAll(HWND hwnd); // fwd decl
+
+// Reads all dialog controls + temp colors/font into Config (with clamping)
+// and repaints the clock. Used for both live preview and Save.
+void ApplyPreview(HWND hwnd) {
+    TCHAR buf[64];
+
+    GetDlgItemText(hwnd, ID_EDIT_FONT_SIZE, buf, 64);
+    float v = (float)_wtof(buf);
+    if (v < 4.0f) v = 14.0f;
+    if (v > 200.0f) v = 72.0f;
+    Config::fontSize = v;
+
+    GetDlgItemText(hwnd, ID_EDIT_OUTLINE_WIDTH, buf, 64);
+    v = (float)_wtof(buf);
+    if (v < 0.0f) v = 0.0f;
+    if (v > 50.0f) v = 50.0f;
+    Config::outlineWidth = v;
+
+    GetDlgItemText(hwnd, ID_EDIT_OFFSET_X, buf, 64);
+    Config::offsetX = (float)_wtof(buf);
+    GetDlgItemText(hwnd, ID_EDIT_OFFSET_Y, buf, 64);
+    Config::offsetY = (float)_wtof(buf);
+
+    GetDlgItemText(hwnd, ID_EDIT_TIME_FORMAT, buf, 64);
+    buf[31] = L'\0';
+    if (IsValidTimeFormat(buf)) lstrcpyW(Config::timeFormat, buf);
+
+    Config::animDuration = (int)SendMessage(GetDlgItem(hwnd, ID_TRACK_ANIM_SPEED), TBM_GETPOS, 0, 0) * 100;
+
+    int op = (int)SendMessage(GetDlgItem(hwnd, ID_TRACK_OPACITY), TBM_GETPOS, 0, 0);
+    if (op < 20) op = 20;
+    if (op > 100) op = 100;
+    Config::opacity = op;
+
+    Config::textColor = tempTextColor;
+    Config::outlineColor = tempOutlineColor;
+    lstrcpyW(Config::fontName, tempFontName);
+
+    HWND hParent = GetParent(hwnd);
+    if (hParent) RecalculateAll(hParent);
+}
+
+void RevertPreview(HWND hwnd) {
+    Config::fontSize = g_cfgSnapshot.fontSize;
+    Config::outlineWidth = g_cfgSnapshot.outlineWidth;
+    Config::offsetX = g_cfgSnapshot.offsetX;
+    Config::offsetY = g_cfgSnapshot.offsetY;
+    Config::animDuration = g_cfgSnapshot.animDuration;
+    Config::opacity = g_cfgSnapshot.opacity;
+    Config::textColor = g_cfgSnapshot.textColor;
+    Config::outlineColor = g_cfgSnapshot.outlineColor;
+    lstrcpyW(Config::fontName, g_cfgSnapshot.fontName);
+    lstrcpyW(Config::timeFormat, g_cfgSnapshot.timeFormat);
+
+    HWND hParent = GetParent(hwnd);
+    if (hParent) RecalculateAll(hParent);
+}
 
 // Dark Mode Resources
 HBRUSH hBrushDark = NULL;
@@ -451,11 +574,43 @@ HWND StyleControl(HWND hCtrl) {
     return hCtrl;
 }
 
+// Shared owner-draw renderer for the flat dark-grey buttons
+void DrawDarkButton(LPDRAWITEMSTRUCT pDIS, LPCTSTR text) {
+    COLORREF bg = (pDIS->itemState & ODS_SELECTED) ? RGB(80, 80, 80) : RGB(60, 60, 60);
+    HBRUSH hBrush = CreateSolidBrush(bg);
+    FillRect(pDIS->hDC, &pDIS->rcItem, hBrush);
+    DeleteObject(hBrush);
+
+    HBRUSH hBorder = CreateSolidBrush(RGB(100, 100, 100));
+    FrameRect(pDIS->hDC, &pDIS->rcItem, hBorder);
+    DeleteObject(hBorder);
+
+    SetBkMode(pDIS->hDC, TRANSPARENT);
+    SetTextColor(pDIS->hDC, RGB(220, 220, 220));
+    HFONT hOldFont = (HFONT)SelectObject(pDIS->hDC, hFontSegoe);
+    DrawText(pDIS->hDC, text, -1, &pDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(pDIS->hDC, hOldFont);
+}
+
 // Main procedure for the Settings Dialog
 // Handles all user interactions in the settings window.
 LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch(uMsg) {
         case WM_CREATE: {
+            g_settingsReady = false;
+
+            // Snapshot live config for Cancel/revert (live preview writes to Config)
+            g_cfgSnapshot.fontSize = Config::fontSize;
+            g_cfgSnapshot.outlineWidth = Config::outlineWidth;
+            g_cfgSnapshot.offsetX = Config::offsetX;
+            g_cfgSnapshot.offsetY = Config::offsetY;
+            g_cfgSnapshot.animDuration = Config::animDuration;
+            g_cfgSnapshot.opacity = Config::opacity;
+            g_cfgSnapshot.textColor = Config::textColor;
+            g_cfgSnapshot.outlineColor = Config::outlineColor;
+            lstrcpyW(g_cfgSnapshot.fontName, Config::fontName);
+            lstrcpyW(g_cfgSnapshot.timeFormat, Config::timeFormat);
+
             // "Minimal Modern" Design - Dark Theme
             hBrushDark = CreateSolidBrush(RGB(32, 32, 32)); // Dark Background
             hBrushEdit = CreateSolidBrush(RGB(50, 50, 50)); // Darker Grey Edit Fields
@@ -518,6 +673,22 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
              _stprintf(floatBuf, _T("%.1f"), Config::offsetY);
             SetWindowText(hOffY, floatBuf);
 
+            y += gap;
+            // --- Time Format (strftime) ---
+            StyleControl(CreateWindow(_T("STATIC"), _T("Format"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, xL, y, 70, h, hwnd, NULL, NULL, NULL));
+            HWND hFmt = StyleControl(CreateWindow(_T("EDIT"), _T(""), WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER, xR, y, 160, h, hwnd, (HMENU)ID_EDIT_TIME_FORMAT, NULL, NULL));
+            SetWindowText(hFmt, Config::timeFormat);
+
+            y += gap;
+            // --- Opacity ---
+            StyleControl(CreateWindow(_T("STATIC"), _T("Opacity"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, xL, y, 70, h, hwnd, NULL, NULL, NULL));
+            HWND hOpTrack = CreateWindow(TRACKBAR_CLASS, _T(""), WS_VISIBLE | WS_CHILD | TBS_AUTOTICKS, xR - 10, y, 120, 30, hwnd, (HMENU)ID_TRACK_OPACITY, NULL, NULL);
+            SendMessage(hOpTrack, TBM_SETRANGE, TRUE, MAKELPARAM(20, 100));
+            SendMessage(hOpTrack, TBM_SETPOS, TRUE, Config::opacity);
+            TCHAR opBuf[16];
+            _stprintf(opBuf, _T("%d%%"), Config::opacity);
+            StyleControl(CreateWindow(_T("STATIC"), opBuf, WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 230, y, 40, h, hwnd, (HMENU)ID_STATIC_OPACITY_VAL, NULL, NULL));
+
             y += gap + 10;
             // --- Save / Cancel / Reset ---
             StyleControl(CreateWindow(_T("BUTTON"), _T("Save"), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 10, y, 80, 30, hwnd, (HMENU)ID_BTN_SAVE, NULL, NULL));
@@ -527,6 +698,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             tempTextColor = Config::textColor;
             tempOutlineColor = Config::outlineColor;
             lstrcpyW(tempFontName, Config::fontName);
+            g_settingsReady = true; // Enable live preview from here on
             break;
         }
 
@@ -559,41 +731,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                 SelectObject(pDIS->hDC, hOldFont);
                 return TRUE;
             }
-            if (pDIS->CtlID == ID_BTN_CANCEL) {
-                // Modern Dark Grey
-                COLORREF bg = (pDIS->itemState & ODS_SELECTED) ? RGB(80, 80, 80) : RGB(60, 60, 60);
-                HBRUSH hBrush = CreateSolidBrush(bg);
-                FillRect(pDIS->hDC, &pDIS->rcItem, hBrush);
-                DeleteObject(hBrush);
-
-                HBRUSH hBorder = CreateSolidBrush(RGB(100, 100, 100));
-                FrameRect(pDIS->hDC, &pDIS->rcItem, hBorder);
-                DeleteObject(hBorder);
-
-                SetBkMode(pDIS->hDC, TRANSPARENT);
-                SetTextColor(pDIS->hDC, RGB(220, 220, 220));
-                HFONT hOldFont = (HFONT)SelectObject(pDIS->hDC, hFontSegoe);
-                DrawText(pDIS->hDC, _T("Cancel"), -1, &pDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                SelectObject(pDIS->hDC, hOldFont);
-                return TRUE;
-            }
-            if (pDIS->CtlID == ID_BTN_RESET) {
-                COLORREF bg = (pDIS->itemState & ODS_SELECTED) ? RGB(80, 80, 80) : RGB(60, 60, 60);
-                HBRUSH hBrush = CreateSolidBrush(bg);
-                FillRect(pDIS->hDC, &pDIS->rcItem, hBrush);
-                DeleteObject(hBrush);
-
-                HBRUSH hBorder = CreateSolidBrush(RGB(100, 100, 100));
-                FrameRect(pDIS->hDC, &pDIS->rcItem, hBorder);
-                DeleteObject(hBorder);
-
-                SetBkMode(pDIS->hDC, TRANSPARENT);
-                SetTextColor(pDIS->hDC, RGB(220, 220, 220));
-                HFONT hOldFont = (HFONT)SelectObject(pDIS->hDC, hFontSegoe);
-                DrawText(pDIS->hDC, _T("Defaults"), -1, &pDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                SelectObject(pDIS->hDC, hOldFont);
-                return TRUE;
-            }
+            if (pDIS->CtlID == ID_BTN_CANCEL) { DrawDarkButton(pDIS, _T("Cancel")); return TRUE; }
+            if (pDIS->CtlID == ID_BTN_RESET)  { DrawDarkButton(pDIS, _T("Defaults")); return TRUE; }
+            if (pDIS->CtlID == ID_BTN_ID_FONT){ DrawDarkButton(pDIS, _T("...")); return TRUE; }
             if (pDIS->CtlID == ID_BTN_TEXT_COLOR || pDIS->CtlID == ID_BTN_OUTLINE_COLOR) {
                 HBRUSH hBrush = CreateSolidBrush(pDIS->CtlID == ID_BTN_TEXT_COLOR ? tempTextColor : tempOutlineColor);
                 FillRect(pDIS->hDC, &pDIS->rcItem, hBrush);
@@ -604,40 +744,37 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                 DeleteObject(hBorder);
                 return TRUE;
             }
-            // Generic fallback for other buttons (like "...")
-            if (pDIS->CtlID == ID_BTN_ID_FONT) {
-                 COLORREF bg = (pDIS->itemState & ODS_SELECTED) ? RGB(80, 80, 80) : RGB(60, 60, 60);
-                 HBRUSH hBrush = CreateSolidBrush(bg);
-                 FillRect(pDIS->hDC, &pDIS->rcItem, hBrush);
-                 DeleteObject(hBrush);
-                 
-                 HBRUSH hBorder = CreateSolidBrush(RGB(100, 100, 100));
-                 FrameRect(pDIS->hDC, &pDIS->rcItem, hBorder);
-                 DeleteObject(hBorder);
-
-                 SetBkMode(pDIS->hDC, TRANSPARENT);
-                 SetTextColor(pDIS->hDC, RGB(220, 220, 220));
-                 
-                 HFONT hOldFont = (HFONT)SelectObject(pDIS->hDC, hFontSegoe);
-                 DrawText(pDIS->hDC, _T("..."), -1, &pDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                 SelectObject(pDIS->hDC, hOldFont);
-                 return TRUE;
-            }
             break;
         }
 
         case WM_HSCROLL: {
+             TCHAR valBuf[16];
              if ((HWND)lParam == GetDlgItem(hwnd, ID_TRACK_ANIM_SPEED)) {
                  int pos = SendMessage((HWND)lParam, TBM_GETPOS, 0, 0);
-                 TCHAR valBuf[16];
                  _stprintf(valBuf, _T("%.1fs"), pos / 10.0);
                  SetWindowText(GetDlgItem(hwnd, ID_STATIC_DURATION_VAL), valBuf);
+                 if (g_settingsReady) ApplyPreview(hwnd);
+             } else if ((HWND)lParam == GetDlgItem(hwnd, ID_TRACK_OPACITY)) {
+                 int pos = SendMessage((HWND)lParam, TBM_GETPOS, 0, 0);
+                 _stprintf(valBuf, _T("%d%%"), pos);
+                 SetWindowText(GetDlgItem(hwnd, ID_STATIC_OPACITY_VAL), valBuf);
+                 if (g_settingsReady) ApplyPreview(hwnd);
              }
              break;
         }
 
         case WM_COMMAND: {
             int wmId = LOWORD(wParam);
+
+            // Live preview: any edit field change applies immediately
+            if (HIWORD(wParam) == EN_CHANGE && g_settingsReady &&
+                (wmId == ID_EDIT_FONT_SIZE || wmId == ID_EDIT_OUTLINE_WIDTH ||
+                 wmId == ID_EDIT_OFFSET_X || wmId == ID_EDIT_OFFSET_Y ||
+                 wmId == ID_EDIT_TIME_FORMAT)) {
+                ApplyPreview(hwnd);
+                break;
+            }
+
             switch(wmId) {
                 case ID_BTN_ID_FONT: {
                     CHOOSEFONT cf = {0};
@@ -660,6 +797,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                     if (ChooseFont(&cf)) {
                         lstrcpyW(tempFontName, lf.lfFaceName);
                         SetWindowText(GetDlgItem(hwnd, ID_STATIC_FONT_NAME), tempFontName);
+                        ApplyPreview(hwnd);
                     }
                     break;
                 }
@@ -674,6 +812,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                     if (ChooseColor(&cc)) {
                         tempTextColor = cc.rgbResult;
                         InvalidateRect(hColorBtn1, NULL, TRUE);
+                        ApplyPreview(hwnd);
                     }
                     break;
                 }
@@ -688,89 +827,85 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                     if (ChooseColor(&cc)) {
                         tempOutlineColor = cc.rgbResult;
                         InvalidateRect(hColorBtn2, NULL, TRUE);
+                        ApplyPreview(hwnd);
                     }
                     break;
                 }
                 case ID_BTN_SAVE: {
-                    TCHAR buf[32];
-                    GetDlgItemText(hwnd, ID_EDIT_FONT_SIZE, buf, 32);
-                    Config::fontSize = (float)_wtof(buf);
-                    
-                    GetDlgItemText(hwnd, ID_EDIT_OUTLINE_WIDTH, buf, 32);
-                    Config::outlineWidth = (float)_wtof(buf);
-
-                    // Read Slider Position -> Duration ms
-                    int pos = SendMessage(GetDlgItem(hwnd, ID_TRACK_ANIM_SPEED), TBM_GETPOS, 0, 0);
-                    Config::animDuration = pos * 100;
-                    
-                    GetDlgItemText(hwnd, ID_EDIT_OFFSET_X, buf, 32);
-                    Config::offsetX = (float)_wtof(buf);
-                    
-                    GetDlgItemText(hwnd, ID_EDIT_OFFSET_Y, buf, 32);
-                    Config::offsetY = (float)_wtof(buf);
-                    
-                    Config::textColor = tempTextColor;
-                    Config::outlineColor = tempOutlineColor;
-                    lstrcpyW(Config::fontName, tempFontName);
-                    
+                    // Live preview already keeps Config in sync; apply once
+                    // more (final clamp) and persist.
+                    ApplyPreview(hwnd);
                     SaveConfig();
-                    
-                    HWND hParent = GetParent(hwnd);
-                    if (hParent) RecalculateAll(hParent);
-                    
                     DestroyWindow(hwnd);
                     break;
                 }
                 case ID_BTN_CANCEL:
+                    RevertPreview(hwnd); // Undo live-preview changes
                     DestroyWindow(hwnd);
                     break;
                 case ID_BTN_RESET: {
+                    // Reset temp state + UI controls to defaults. The
+                    // EN_CHANGE/ApplyPreview flow previews it live; Cancel
+                    // still restores the pre-dialog snapshot.
                     tempTextColor = RGB(255, 255, 255);
                     tempOutlineColor = RGB(0, 0, 0);
                     lstrcpyW(tempFontName, L"Segoe UI");
-                    Config::fontSize = 14.0f;
-                    Config::outlineWidth = 2.0f;
-                    Config::animDuration = 500;
-                    Config::offsetX = 0.0f;
-                    Config::offsetY = 0.0f;
+                    const float defFontSize = 14.0f;
+                    const float defOutlineWidth = 2.0f;
+                    const int defAnimDuration = 500;
+                    const float defOffsetX = 0.0f;
+                    const float defOffsetY = 0.0f;
 
                     TCHAR buf[32];
-                    _stprintf(buf, _T("%.1f"), Config::fontSize);
+                    _stprintf(buf, _T("%.1f"), defFontSize);
                     SetWindowText(GetDlgItem(hwnd, ID_EDIT_FONT_SIZE), buf);
-                    
-                    _stprintf(buf, _T("%.1f"), Config::outlineWidth);
+
+                    _stprintf(buf, _T("%.1f"), defOutlineWidth);
                     SetWindowText(GetDlgItem(hwnd, ID_EDIT_OUTLINE_WIDTH), buf);
-                    
-                    SendMessage(GetDlgItem(hwnd, ID_TRACK_ANIM_SPEED), TBM_SETPOS, TRUE, Config::animDuration / 100);
-                    _stprintf(buf, _T("%.1fs"), Config::animDuration / 1000.0);
+
+                    SendMessage(GetDlgItem(hwnd, ID_TRACK_ANIM_SPEED), TBM_SETPOS, TRUE, defAnimDuration / 100);
+                    _stprintf(buf, _T("%.1fs"), defAnimDuration / 1000.0);
                     SetWindowText(GetDlgItem(hwnd, ID_STATIC_DURATION_VAL), buf);
 
-                    _stprintf(buf, _T("%.1f"), Config::offsetX);
+                    _stprintf(buf, _T("%.1f"), defOffsetX);
                     SetWindowText(GetDlgItem(hwnd, ID_EDIT_OFFSET_X), buf);
-                    
-                    _stprintf(buf, _T("%.1f"), Config::offsetY);
+
+                    _stprintf(buf, _T("%.1f"), defOffsetY);
                     SetWindowText(GetDlgItem(hwnd, ID_EDIT_OFFSET_Y), buf);
+
+                    SetWindowText(GetDlgItem(hwnd, ID_EDIT_TIME_FORMAT), L"%H:%M");
+
+                    SendMessage(GetDlgItem(hwnd, ID_TRACK_OPACITY), TBM_SETPOS, TRUE, 100);
+                    SetWindowText(GetDlgItem(hwnd, ID_STATIC_OPACITY_VAL), _T("100%"));
 
                     SetWindowText(GetDlgItem(hwnd, ID_STATIC_FONT_NAME), tempFontName);
 
                     InvalidateRect(hColorBtn1, NULL, TRUE);
                     InvalidateRect(hColorBtn2, NULL, TRUE);
+                    ApplyPreview(hwnd);
                     break;
                 }
             }
             break;
         }
         case WM_CLOSE:
+            RevertPreview(hwnd); // X button = Cancel
+            DestroyWindow(hwnd);
+            break;
+        case WM_DESTROY:
+            // Cleanup here (not WM_CLOSE) so Save/Cancel paths that call
+            // DestroyWindow directly also release the GDI resources.
             if (hBrushDark) { DeleteObject(hBrushDark); hBrushDark = NULL; }
             if (hBrushEdit) { DeleteObject(hBrushEdit); hBrushEdit = NULL; }
             if (hFontSegoe) { DeleteObject(hFontSegoe); hFontSegoe = NULL; }
-            DestroyWindow(hwnd);
             break;
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
 void DoSettingsDialog(HWND parent) {
+    if (g_settingsOpen) return; // Tray clicks can still reach the disabled parent
+    g_settingsOpen = true;
     const TCHAR CLASS_NAME[] = _T("EdgeClockSettings");
     WNDCLASS wc = { };
     if (!GetClassInfo(GetModuleHandle(NULL), CLASS_NAME, &wc)) {
@@ -784,7 +919,7 @@ void DoSettingsDialog(HWND parent) {
     
     HWND hDlg = CreateWindowEx(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, CLASS_NAME, _T("EdgeClock Settings"), 
         WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU, 
-        (GetSystemMetrics(SM_CXSCREEN)/2)-150, (GetSystemMetrics(SM_CYSCREEN)/2)-170, 300, 360, parent, NULL, GetModuleHandle(NULL), NULL);
+        (GetSystemMetrics(SM_CXSCREEN)/2)-150, (GetSystemMetrics(SM_CYSCREEN)/2)-220, 300, 440, parent, NULL, GetModuleHandle(NULL), NULL);
     
     // Enable Dark Mode for Title Bar
     BOOL useDarkMode = TRUE;
@@ -798,14 +933,32 @@ void DoSettingsDialog(HWND parent) {
     }
     EnableWindow(parent, TRUE);
     SetForegroundWindow(parent);
+    g_settingsOpen = false;
 }
 
 
+// Begins a slide animation from the current position, capturing the start
+// time/position for the time-based interpolation in the animation timer.
+void StartSlide(HWND hwnd, AnimState newState) {
+    currentState = newState;
+    animStartTick = GetTickCount64();
+    animStartY = currentYVal;
+    SetTimer(hwnd, 3, Config::refreshRate, NULL);
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    // Re-add tray icon when Explorer restarts (icon is lost otherwise)
+    if (g_msgTaskbarCreated && uMsg == g_msgTaskbarCreated) {
+        Shell_NotifyIcon(NIM_ADD, &nid);
+        UpdateScreenMetrics();
+        RecalculateAll(hwnd);
+        return 0;
+    }
+
     switch (uMsg) {
     case WM_CREATE:
-        screenW = GetSystemMetrics(SM_CXSCREEN);
-        screenH = GetSystemMetrics(SM_CYSCREEN);
+        g_msgTaskbarCreated = RegisterWindowMessage(_T("TaskbarCreated"));
+        UpdateScreenMetrics();
         RecalculateAll(hwnd);
         currentState = STATE_VISIBLE;
         currentYVal = (float)targetY; 
@@ -823,15 +976,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_DISPLAYCHANGE:
     case WM_SETTINGCHANGE:
         if (uMsg == WM_DISPLAYCHANGE || (uMsg == WM_SETTINGCHANGE && wParam == SPI_SETWORKAREA)) {
-            screenW = GetSystemMetrics(SM_CXSCREEN);
-            screenH = GetSystemMetrics(SM_CYSCREEN);
+            UpdateScreenMetrics();
             RecalculateAll(hwnd);
+            return 0;
         }
+        break;
+
+    case 0x02E0 /*WM_DPICHANGED*/:
+        // PerMonitorV2: re-measure text and reposition on the new DPI
+        UpdateScreenMetrics();
+        RecalculateAll(hwnd);
         return 0;
 
     case WM_TRAYICON:
         if (lParam == WM_RBUTTONUP) {
             ShowContextMenu(hwnd);
+        } else if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
+            DoSettingsDialog(hwnd); // Left-click opens Settings
         }
         return 0;
 
@@ -876,40 +1037,43 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_TIMER: {
         if (wParam == 3) { // Animation Timer
             bool animating = false;
-            
-            // PRECISE ANIMATION LOGIC
-            // To ensure the animation takes exactly 'Config::animDuration' seconds,
-            // we calculate the step size based on current distance and remaining time?
-            // Or simpler: Constant Speed = Total Distance / Total Time
-            
-            float distance = (float)clockSize.cy; // Slide distance is roughly the height
-            float totalTime = (float)Config::animDuration;
-            if (totalTime <= 0) totalTime = 1.0f;
-            
-            float stepPerMs = distance / totalTime;
-            float step = stepPerMs * Config::refreshRate; 
-            
-            if (currentState == STATE_SLIDING_UP) {
-                currentYVal -= step;
-                if (currentYVal <= (float)targetY) {
-                    currentYVal = (float)targetY;
-                    currentState = STATE_VISIBLE;
+
+            // TIME-BASED ANIMATION with ease-out cubic.
+            // Progress derives from wall-clock elapsed time, so the slide
+            // always finishes in exactly animDuration ms even when timer
+            // ticks are delayed (IDLE priority / EcoQoS).
+            if (currentState == STATE_SLIDING_UP || currentState == STATE_SLIDING_DOWN) {
+                float endY = (currentState == STATE_SLIDING_UP) ? (float)targetY : (float)screenH;
+                float totalTime = (float)Config::animDuration;
+
+                float progress;
+                if (totalTime <= 0.0f) {
+                    progress = 1.0f;
+                } else {
+                    progress = (float)(GetTickCount64() - animStartTick) / totalTime;
+                    if (progress > 1.0f) progress = 1.0f;
+                }
+
+                // Ease-out cubic: fast start, gentle landing
+                float inv = 1.0f - progress;
+                float eased = 1.0f - inv * inv * inv;
+
+                currentYVal = animStartY + (endY - animStartY) * eased;
+                animating = true;
+
+                if (progress >= 1.0f) {
+                    currentYVal = endY;
+                    currentState = (currentState == STATE_SLIDING_UP) ? STATE_VISIBLE : STATE_HIDDEN;
                     KillTimer(hwnd, 3);
                 }
-                animating = true;
-            } else if (currentState == STATE_SLIDING_DOWN) {
-                currentYVal += step;
-                if (currentYVal >= (float)screenH) {
-                    currentYVal = (float)screenH;
-                    currentState = STATE_HIDDEN;
-                    KillTimer(hwnd, 3);
-                }
-                animating = true;
             } else if (currentState == STATE_VISIBLE) {
                  if ((int)currentYVal != targetY) {
                      currentYVal = (float)targetY;
                      animating = true;
                  }
+                 KillTimer(hwnd, 3);
+            } else {
+                 KillTimer(hwnd, 3); // Hidden — nothing to animate
             }
 
             if (animating) {
@@ -920,9 +1084,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         if (wParam == 2) { // Clock Update
             if (currentState == STATE_VISIBLE || currentState == STATE_SLIDING_UP) {
-               static TCHAR lastTime[10] = {0};
-               TCHAR curTime[10];
-               GetTime(curTime, 10);
+               static TCHAR lastTime[64] = {0};
+               TCHAR curTime[64];
+               GetTime(curTime, 64);
                if (_tcscmp(lastTime, curTime) != 0) {
                    _tcscpy(lastTime, curTime);
                    UpdateLayeredWindowContent(hwnd);
@@ -946,22 +1110,46 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 shouldHide = true;
             }
             
+            // Taskbar check — edge-aware. Only a bottom taskbar can cover the
+            // clock; left/right/top placements never overlap the bottom edge.
             HWND hTray = FindWindow(_T("Shell_TrayWnd"), NULL);
             if (hTray) {
-                RECT rcTray;
-                GetWindowRect(hTray, &rcTray);
-                // Use Config::taskbarThreshold
-                if (rcTray.top < screenH - Config::taskbarThreshold) { 
-                    shouldHide = true;
+                APPBARDATA abd = { sizeof(abd) };
+                UINT edge = ABE_BOTTOM; // Assume bottom if ABM query fails
+                if (SHAppBarMessage(ABM_GETTASKBARPOS, &abd)) {
+                    edge = abd.uEdge;
+                }
+                if (edge == ABE_BOTTOM) {
+                    RECT rcTray;
+                    GetWindowRect(hTray, &rcTray);
+                    if (rcTray.top < screenH - Config::taskbarThreshold) {
+                        shouldHide = true;
+                    }
                 }
             }
 
+            // Fullscreen / presentation detection via the shell (robust for
+            // D3D games, F11 fullscreen, presentation mode)
+            if (!shouldHide) {
+                QUERY_USER_NOTIFICATION_STATE quns;
+                if (SUCCEEDED(SHQueryUserNotificationState(&quns))) {
+                    if (quns == QUNS_RUNNING_D3D_FULL_SCREEN ||
+                        quns == QUNS_PRESENTATION_MODE ||
+                        quns == QUNS_BUSY) {
+                        shouldHide = true;
+                    }
+                }
+            }
+
+            // Fallback: foreground window exactly covering its own monitor
             if (!shouldHide) {
                 HWND hFore = GetForegroundWindow();
                 if (hFore) {
-                    RECT rc; 
+                    RECT rc;
                     GetWindowRect(hFore, &rc);
-                    if ((rc.right - rc.left) == screenW && (rc.bottom - rc.top) == screenH) {
+                    HMONITOR hMon = MonitorFromWindow(hFore, MONITOR_DEFAULTTONEAREST);
+                    MONITORINFO mi = { sizeof(mi) };
+                    if (GetMonitorInfo(hMon, &mi) && EqualRect(&rc, &mi.rcMonitor)) {
                          TCHAR cName[256];
                          GetClassName(hFore, cName, 256);
                          if (_tcscmp(cName, _T("Progman")) != 0 && _tcscmp(cName, _T("WorkerW")) != 0 && _tcscmp(cName, _T("Shell_TrayWnd")) != 0) {
@@ -974,13 +1162,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             // Perform logic check (should we hide?)
             if (shouldHide) {
                 if (currentState == STATE_VISIBLE || currentState == STATE_SLIDING_UP) {
-                    currentState = STATE_SLIDING_DOWN;
-                    SetTimer(hwnd, 3, Config::refreshRate, NULL); // Start animation
+                    StartSlide(hwnd, STATE_SLIDING_DOWN);
                 }
             } else {
                 if (currentState == STATE_HIDDEN || currentState == STATE_SLIDING_DOWN) {
-                    currentState = STATE_SLIDING_UP;
-                    SetTimer(hwnd, 3, Config::refreshRate, NULL); // Start animation
+                    StartSlide(hwnd, STATE_SLIDING_UP);
                 }
             }
             return 0;
@@ -1072,7 +1258,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     EnableEfficiencyMode();
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    CreateStartMenuShortcut();
 
     // Init Common Controls for "Modern" Visual Styles (requires manifest)
     INITCOMMONCONTROLSEX icex;

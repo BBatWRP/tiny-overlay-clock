@@ -17,3 +17,7 @@ Desktop.ini
 
 Output/
 *.o
+
+# Runtime logs
+EdgeClock_Log.txt
+**/EdgeClock_Log.txt

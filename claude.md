@@ -54,16 +54,34 @@ Or run `build.bat`. Requires MinGW with `g++` and `windres`.
 - **Single Instance**: Uses a named mutex `EdgeClock_GlobalInstance_Mutex`
 - **RAM Trimming**: Calls `SetProcessWorkingSetSize(-1, -1)` after init and each minute redraw
 
-## Known Issues
-- None currently — all previously known bugs have been fixed.
+## Known Issues / Limitations
+- Clock follows the monitor hosting the taskbar (via `MonitorFromWindow`); no per-monitor user override yet
+- Settings dialog layout is fixed-pixel (not DPI-scaled)
 
 ## Recent Fixes
 - Log path now resolves next to exe (was relative to CWD)
 - Startup registry path is now quoted for paths with spaces
-- `IsStartupEnabled` validates the stored path matches the current exe
+- `IsStartupEnabled` checks the stored path contains `edgeclock.exe` (substring check, not a full path match against the current exe)
 - Settings dialog GDI resources properly nulled after deletion (was use-after-free)
 - Settings class brush uses stock object (was leaked)
 - Size presets now persist to registry via `SaveConfig()`
 - `WM_ENDSESSION` handler for graceful shutdown/logoff cleanup
 - Mutex handle properly closed on exit
 - Manifest declares PerMonitorV2 DPI awareness
+- Settings dialog GDI brushes/font freed in `WM_DESTROY` (was `WM_CLOSE`, leaked on Save/Cancel)
+- "Defaults" button only updates temp/UI state — Cancel after Defaults no longer mutates live config
+- Save clamps font size (4–200) and outline width (0–50) against invalid input
+- Slide animation distance includes `offsetY` so duration matches the configured value
+
+## Recent Improvements (2026-07)
+- **Multi-monitor**: clock positions on the monitor hosting the taskbar (`UpdateScreenMetrics`)
+- **Fullscreen detection**: `SHQueryUserNotificationState` (D3D fullscreen / presentation / F11) + per-monitor rect fallback
+- **Taskbar edge-aware**: only a bottom taskbar triggers auto-hide (`ABM_GETTASKBARPOS`)
+- **Custom time format**: `Config::timeFormat` (strftime, validated) — supports seconds, 12h, date
+- **Opacity setting**: `Config::opacity` (20–100%) via `SourceConstantAlpha`
+- **Live preview**: settings apply instantly; Cancel/X restores a snapshot taken at dialog open
+- **Time-based animation**: wall-clock progress + ease-out cubic (immune to timer jitter under IDLE priority)
+- **Tray icon survives Explorer restart** (`TaskbarCreated` re-registration)
+- **Left-click tray icon opens Settings**; `WM_DPICHANGED` handled
+- Removed auto-recreation of Start Menu shortcut (installer owns it)
+- `WM_DRAWITEM` button painting deduplicated into `DrawDarkButton`
