@@ -1,7 +1,7 @@
 [Setup]
 AppName=EdgeClock
 AppVersion=1.0.0.0
-DefaultDirName={pf}\EdgeClock
+DefaultDirName={autopf}\EdgeClock
 DefaultGroupName=EdgeClock
 OutputDir=Output
 OutputBaseFilename=EdgeClockSetup_v1.0
@@ -11,6 +11,9 @@ SetupIconFile=clock_23989.ico
 UninstallDisplayIcon={app}\EdgeClock.exe
 ; Require admin privileges for Program Files
 PrivilegesRequired=admin
+; HKCU Run key is intentional: it targets the installing user, and the app
+; itself has a "Run on Startup" toggle to fix it for any other user.
+UsedUserAreasWarning=no
 ArchitecturesInstallIn64BitMode=x64
 DisableDirPage=no
 
