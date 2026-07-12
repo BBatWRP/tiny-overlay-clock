@@ -21,3 +21,6 @@ Output/
 # Runtime logs
 EdgeClock_Log.txt
 **/EdgeClock_Log.txt
+
+# Installed app directory (managed by the installer, not the repo)
+EdgeClock/

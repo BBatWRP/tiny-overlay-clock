@@ -1,10 +1,10 @@
 [Setup]
 AppName=EdgeClock
-AppVersion=1.0.0.0
+AppVersion=1.1.0.0
 DefaultDirName={autopf}\EdgeClock
 DefaultGroupName=EdgeClock
 OutputDir=Output
-OutputBaseFilename=EdgeClockSetup_v1.0
+OutputBaseFilename=EdgeClockSetup_v1.1
 Compression=lzma2
 SolidCompression=yes
 SetupIconFile=clock_23989.ico

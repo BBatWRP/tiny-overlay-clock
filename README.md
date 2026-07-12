@@ -9,7 +9,11 @@ EdgeClock blends seamlessly into your desktop environment, providing time withou
 ## 🚀 Features
 
 * **Edge-Clinging Design**: Snaps perfectly to the bottom-right of your screen, blending into your current workflow.
-* **Smart Auto-Hide**: Detects when you need screen space. Automatically slides out of view when hovering or when fullscreen/maximized applications are open.
+* **Multi-Monitor Aware**: Automatically follows the monitor hosting your taskbar.
+* **Smart Auto-Hide**: Slides out of view on hover, when the taskbar is raised (bottom-taskbar aware), or when fullscreen apps run — detected reliably via the Windows shell (D3D games, F11 fullscreen, presentation mode).
+* **Custom Time Format**: Any `strftime` pattern — seconds (`%H:%M:%S`), 12-hour (`%I:%M %p`), or date (`%a %d %H:%M`).
+* **Opacity Control**: Blend the clock into your wallpaper at 20–100% opacity.
+* **Live Preview**: Every setting applies instantly as you change it; Cancel restores everything.
 * **Extreme Efficiency**: 
   * Integrates with Windows EcoQoS to minimize CPU impact and battery drain.
   * Aggressively trims RAM Working Set down to ~1-2 MB after initialization and updates.
@@ -17,8 +21,8 @@ EdgeClock blends seamlessly into your desktop environment, providing time withou
 * **Fully Customizable**:
   * **Typography**: Select any installed system font and tweak size easily.
   * **Colors**: Personalize the text and outline colors to match your wallpaper.
-  * **Animation Control**: Adjust the sliding speed and duration.
-  * **Positioning**: Fine-tune the X and Y offsets for precise dual-monitor alignment.
+  * **Animation Control**: Adjust the slide duration — time-based easing stays smooth even under heavy CPU load.
+  * **Positioning**: Fine-tune the X and Y offsets for precise alignment.
 * **Single Instance Lock**: Ensures only one clock process runs at a time to prevent resource overlap.
 * **Zero Dependencies**: Built pure and statically linked—no heavy frameworks like .NET or Electron required.
 
@@ -77,8 +81,8 @@ graph TD
 ### Usage
 
 1. Launch `EdgeClock.exe`. The clock will appear smoothly in the bottom-right corner.
-2. **Right-click** the clock text or the EdgeClock system tray icon to access the menu.
-3. Select **Settings...** to customize fonts, colors, offsets, and animation speed.
+2. **Right-click** the EdgeClock system tray icon to access the menu, or **left-click** it to open Settings directly.
+3. In **Settings** you can customize font, size, colors, time format, opacity, offsets, and animation speed — changes preview live as you adjust them.
 4. Toggle **Run on Startup** to have EdgeClock launch automatically when you log into Windows.
 
 ---
