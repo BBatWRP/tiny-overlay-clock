@@ -15,9 +15,10 @@
 #include <shlguid.h>
 #include <shlobj.h>
 #include <objbase.h>
-#include <commctrl.h> 
-#include <commdlg.h> 
-#include <dwmapi.h> 
+#include <commctrl.h>
+#include <commdlg.h>
+#include <dwmapi.h>
+#include <uxtheme.h>
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -73,6 +74,7 @@ namespace Config {
     // --- Clock Text ---
     WCHAR timeFormat[32] = L"%H:%M"; // strftime format (e.g. %H:%M:%S, %I:%M %p, %a %d %H:%M)
     int opacity = 100;               // Clock opacity in percent (20-100)
+    int effectMode = 0;              // 0 = Outline, 1 = Soft Shadow, 2 = Glow
 
     // --- Menu Presets ---
     const float sizeSmall = 16.0f;
@@ -96,6 +98,7 @@ void SaveConfig() {
         RegSetValueEx(hKey, _T("FontName"), 0, REG_SZ, (const BYTE*)Config::fontName, (lstrlenW(Config::fontName) + 1) * sizeof(WCHAR));
         RegSetValueEx(hKey, _T("TimeFormat"), 0, REG_SZ, (const BYTE*)Config::timeFormat, (lstrlenW(Config::timeFormat) + 1) * sizeof(WCHAR));
         RegSetValueEx(hKey, _T("Opacity"), 0, REG_DWORD, (const BYTE*)&Config::opacity, sizeof(int));
+        RegSetValueEx(hKey, _T("EffectMode"), 0, REG_DWORD, (const BYTE*)&Config::effectMode, sizeof(int));
         RegCloseKey(hKey);
     }
 }
@@ -144,6 +147,7 @@ void LoadConfig() {
              Config::timeFormat[31] = L'\0';
         }
         RegQueryValueEx(hKey, _T("Opacity"), NULL, NULL, (LPBYTE)&Config::opacity, &sizeInt);
+        RegQueryValueEx(hKey, _T("EffectMode"), NULL, NULL, (LPBYTE)&Config::effectMode, &sizeInt);
 
         RegCloseKey(hKey);
     }
@@ -154,6 +158,7 @@ void LoadConfig() {
     if (Config::animDuration < 0) Config::animDuration = 500;
     if (Config::opacity < 20) Config::opacity = 20;
     if (Config::opacity > 100) Config::opacity = 100;
+    if (Config::effectMode < 0 || Config::effectMode > 2) Config::effectMode = 0;
     if (!IsValidTimeFormat(Config::timeFormat)) lstrcpyW(Config::timeFormat, L"%H:%M");
     Log("Config Loaded.");
 }
@@ -188,6 +193,8 @@ void LoadConfig() {
 #define ID_EDIT_TIME_FORMAT 3015
 #define ID_TRACK_OPACITY 3016
 #define ID_STATIC_OPACITY_VAL 3017
+#define ID_COMBO_EFFECT 3018
+#define ID_COMBO_FORMAT 3019
 
 enum AnimState {
     STATE_VISIBLE,
@@ -246,6 +253,18 @@ void GetTime(TCHAR* buffer, int size) {
     }
 }
 
+// Padding (per side) the current text effect needs around the glyphs so
+// nothing clips at the window edge. Shadow/glow spread wider than a stroke.
+float EffectPad() {
+    switch (Config::effectMode) {
+        case 1: // Soft shadow: offset + blur spread
+        case 2: // Glow: halo radius
+            return Config::outlineWidth * 2.0f + 2.0f;
+        default: // Outline stroke
+            return Config::outlineWidth;
+    }
+}
+
 void UpdateLayeredWindowContent(HWND hwnd) {
     int width = clockSize.cx;
     int height = clockSize.cy;
@@ -287,17 +306,58 @@ void UpdateLayeredWindowContent(HWND hwnd) {
     GetTime(timeBuf, 64);
 
     GraphicsPath path;
-    RectF rect(0, 0, (REAL)width - (REAL)Config::outlineWidth, (REAL)height); 
-    
+    float pad = EffectPad();
+    RectF rect(0, 0, (REAL)width - pad, (REAL)height - (Config::effectMode == 0 ? 0.0f : pad));
+
     path.AddString(timeBuf, -1, pFamily, FontStyleBold, (REAL)Config::fontSize, rect, &format);
 
-    Pen pen(Color(255, GetRValue(Config::outlineColor), GetGValue(Config::outlineColor), GetBValue(Config::outlineColor)), (REAL)Config::outlineWidth);
-    pen.SetLineJoin(LineJoinRound);
-    graphics.DrawPath(&pen, &path);
-
+    BYTE fxR = GetRValue(Config::outlineColor), fxG = GetGValue(Config::outlineColor), fxB = GetBValue(Config::outlineColor);
     SolidBrush brush(Color(255, GetRValue(Config::textColor), GetGValue(Config::textColor), GetBValue(Config::textColor)));
-    graphics.FillPath(&brush, &path);
-    
+
+    float ew = Config::outlineWidth;
+    if (ew < 0.5f) ew = 0.5f;
+
+    switch (Config::effectMode) {
+        case 1: { // Soft Shadow: blurred dark copy offset down-right, then clean text
+            GraphicsPath* shadow = path.Clone();
+            Matrix m;
+            float off = ew * 0.75f + 1.0f;
+            m.Translate(off, off);
+            shadow->Transform(&m);
+
+            // Cheap gaussian-ish blur: stacked strokes, wide->narrow, low alpha
+            const int layers = 4;
+            for (int i = layers; i >= 1; --i) {
+                Pen p(Color(22, fxR, fxG, fxB), ew * 2.0f * i / (float)layers);
+                p.SetLineJoin(LineJoinRound);
+                graphics.DrawPath(&p, shadow);
+            }
+            SolidBrush shadowFill(Color(130, fxR, fxG, fxB));
+            graphics.FillPath(&shadowFill, shadow);
+            delete shadow;
+
+            graphics.FillPath(&brush, &path);
+            break;
+        }
+        case 2: { // Glow: concentric low-alpha halos around the glyphs
+            const int layers = 5;
+            for (int i = layers; i >= 1; --i) {
+                Pen p(Color(28, fxR, fxG, fxB), ew * 2.0f * i / (float)layers);
+                p.SetLineJoin(LineJoinRound);
+                graphics.DrawPath(&p, &path);
+            }
+            graphics.FillPath(&brush, &path);
+            break;
+        }
+        default: { // Outline (classic)
+            Pen pen(Color(255, fxR, fxG, fxB), (REAL)Config::outlineWidth);
+            pen.SetLineJoin(LineJoinRound);
+            graphics.DrawPath(&pen, &path);
+            graphics.FillPath(&brush, &path);
+            break;
+        }
+    }
+
     delete pFamily; // Clean up
 
     POINT ptSrc = { 0, 0 };
@@ -347,10 +407,11 @@ SIZE CalculateTextSize() {
         boundingBox.Height = 50;
     }
     
-    // Calcluate bounding box strictly based on content + outline
+    // Calcluate bounding box strictly based on content + effect padding
+    float pad = EffectPad();
     SIZE sz;
-    sz.cx = (int)ceil(boundingBox.Width + Config::outlineWidth * 2.0f); 
-    sz.cy = (int)ceil(boundingBox.Height + Config::outlineWidth * 2.0f);
+    sz.cx = (int)ceil(boundingBox.Width + pad * 2.0f);
+    sz.cy = (int)ceil(boundingBox.Height + pad * 2.0f);
     
     delete pFamily;
     ReleaseDC(NULL, hdc);
@@ -488,7 +549,7 @@ HWND hColorBtn1, hColorBtn2;
 // Enables live preview: every control change applies to Config immediately.
 struct ConfigSnapshot {
     float fontSize, outlineWidth, offsetX, offsetY;
-    int animDuration, opacity;
+    int animDuration, opacity, effectMode;
     COLORREF textColor, outlineColor;
     WCHAR fontName[32];
     WCHAR timeFormat[32];
@@ -531,6 +592,9 @@ void ApplyPreview(HWND hwnd) {
     if (op > 100) op = 100;
     Config::opacity = op;
 
+    int fx = (int)SendMessage(GetDlgItem(hwnd, ID_COMBO_EFFECT), CB_GETCURSEL, 0, 0);
+    if (fx >= 0 && fx <= 2) Config::effectMode = fx;
+
     Config::textColor = tempTextColor;
     Config::outlineColor = tempOutlineColor;
     lstrcpyW(Config::fontName, tempFontName);
@@ -546,6 +610,7 @@ void RevertPreview(HWND hwnd) {
     Config::offsetY = g_cfgSnapshot.offsetY;
     Config::animDuration = g_cfgSnapshot.animDuration;
     Config::opacity = g_cfgSnapshot.opacity;
+    Config::effectMode = g_cfgSnapshot.effectMode;
     Config::textColor = g_cfgSnapshot.textColor;
     Config::outlineColor = g_cfgSnapshot.outlineColor;
     lstrcpyW(Config::fontName, g_cfgSnapshot.fontName);
@@ -574,22 +639,75 @@ HWND StyleControl(HWND hCtrl) {
     return hCtrl;
 }
 
+// --- Hover tracking for owner-drawn buttons ---
+HWND g_hoverBtn = NULL;
+
+LRESULT CALLBACK ButtonHoverProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+                                 UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
+    switch (uMsg) {
+        case WM_MOUSEMOVE:
+            if (g_hoverBtn != hwnd) {
+                g_hoverBtn = hwnd;
+                InvalidateRect(hwnd, NULL, TRUE);
+                TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+                TrackMouseEvent(&tme);
+            }
+            break;
+        case WM_MOUSELEAVE:
+            if (g_hoverBtn == hwnd) {
+                g_hoverBtn = NULL;
+                InvalidateRect(hwnd, NULL, TRUE);
+            }
+            break;
+        case WM_NCDESTROY:
+            if (g_hoverBtn == hwnd) g_hoverBtn = NULL;
+            RemoveWindowSubclass(hwnd, ButtonHoverProc, uIdSubclass);
+            break;
+    }
+    return DefSubclassProc(hwnd, uMsg, wParam, lParam);
+}
+
+HWND HoverButton(HWND hBtn) {
+    SetWindowSubclass(hBtn, ButtonHoverProc, 1, 0);
+    return hBtn;
+}
+
 // Shared owner-draw renderer for the flat dark-grey buttons
 void DrawDarkButton(LPDRAWITEMSTRUCT pDIS, LPCTSTR text) {
-    COLORREF bg = (pDIS->itemState & ODS_SELECTED) ? RGB(80, 80, 80) : RGB(60, 60, 60);
+    bool hover = (g_hoverBtn == pDIS->hwndItem);
+    COLORREF bg = (pDIS->itemState & ODS_SELECTED) ? RGB(85, 85, 85)
+                : hover ? RGB(74, 74, 74) : RGB(60, 60, 60);
     HBRUSH hBrush = CreateSolidBrush(bg);
     FillRect(pDIS->hDC, &pDIS->rcItem, hBrush);
     DeleteObject(hBrush);
 
-    HBRUSH hBorder = CreateSolidBrush(RGB(100, 100, 100));
+    HBRUSH hBorder = CreateSolidBrush(hover ? RGB(140, 140, 140) : RGB(100, 100, 100));
     FrameRect(pDIS->hDC, &pDIS->rcItem, hBorder);
     DeleteObject(hBorder);
 
     SetBkMode(pDIS->hDC, TRANSPARENT);
-    SetTextColor(pDIS->hDC, RGB(220, 220, 220));
+    SetTextColor(pDIS->hDC, hover ? RGB(255, 255, 255) : RGB(220, 220, 220));
     HFONT hOldFont = (HFONT)SelectObject(pDIS->hDC, hFontSegoe);
     DrawText(pDIS->hDC, text, -1, &pDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(pDIS->hDC, hOldFont);
+}
+
+// --- Time format presets shown in the Settings combo ---
+struct FormatPreset { const WCHAR* label; const WCHAR* fmt; };
+const FormatPreset kFormatPresets[] = {
+    { L"24-hour  (14:35)",   L"%H:%M" },
+    { L"24-hour + seconds",  L"%H:%M:%S" },
+    { L"12-hour  (2:35 PM)", L"%I:%M %p" },
+    { L"12-hour + seconds",  L"%I:%M:%S %p" },
+    { L"Date + time (Sat 12)", L"%a %d %H:%M" },
+};
+const int kNumFormatPresets = (int)(sizeof(kFormatPresets) / sizeof(kFormatPresets[0]));
+
+// Returns the preset index matching fmt, or kNumFormatPresets ("Custom")
+int MatchFormatPreset(const WCHAR* fmt) {
+    for (int i = 0; i < kNumFormatPresets; ++i)
+        if (wcscmp(fmt, kFormatPresets[i].fmt) == 0) return i;
+    return kNumFormatPresets;
 }
 
 // Main procedure for the Settings Dialog
@@ -606,6 +724,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             g_cfgSnapshot.offsetY = Config::offsetY;
             g_cfgSnapshot.animDuration = Config::animDuration;
             g_cfgSnapshot.opacity = Config::opacity;
+            g_cfgSnapshot.effectMode = Config::effectMode;
             g_cfgSnapshot.textColor = Config::textColor;
             g_cfgSnapshot.outlineColor = Config::outlineColor;
             lstrcpyW(g_cfgSnapshot.fontName, Config::fontName);
@@ -621,7 +740,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             StyleControl(CreateWindow(_T("STATIC"), _T("Font"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, xL, y, 70, h, hwnd, NULL, NULL, NULL));
             StyleControl(CreateWindow(_T("STATIC"), Config::fontName, WS_VISIBLE | WS_CHILD | SS_ENDELLIPSIS | SS_CENTERIMAGE, xR, y, 100, h, hwnd, (HMENU)ID_STATIC_FONT_NAME, NULL, NULL));
             // "Change" button
-            StyleControl(CreateWindow(_T("BUTTON"), _T("..."), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 210, y, 50, h, hwnd, (HMENU)ID_BTN_ID_FONT, NULL, NULL));
+            HoverButton(StyleControl(CreateWindow(_T("BUTTON"), _T("..."), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 210, y, 50, h, hwnd, (HMENU)ID_BTN_ID_FONT, NULL, NULL)));
 
             y += gap;
             // --- Size & Outline ---
@@ -633,7 +752,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             SetWindowText(hSize, floatBuf);
 
             y += gap;
-            StyleControl(CreateWindow(_T("STATIC"), _T("Outline"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, xL, y, 70, h, hwnd, NULL, NULL, NULL));
+            StyleControl(CreateWindow(_T("STATIC"), _T("FX Width"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, xL, y, 70, h, hwnd, NULL, NULL, NULL));
             HWND hOutline = StyleControl(CreateWindow(_T("EDIT"), _T(""), WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER, xR, y, 50, h, hwnd, (HMENU)ID_EDIT_OUTLINE_WIDTH, NULL, NULL));
              _stprintf(floatBuf, _T("%.1f"), Config::outlineWidth);
             SetWindowText(hOutline, floatBuf);
@@ -641,17 +760,27 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             y += gap;
             // --- Colors ---
             StyleControl(CreateWindow(_T("STATIC"), _T("Text Color"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, xL, y, 70, h, hwnd, NULL, NULL, NULL));
-            hColorBtn1 = CreateWindow(_T("BUTTON"), _T(""), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, xR, y, 50, h, hwnd, (HMENU)ID_BTN_TEXT_COLOR, NULL, NULL);
+            hColorBtn1 = HoverButton(CreateWindow(_T("BUTTON"), _T(""), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, xR, y, 50, h, hwnd, (HMENU)ID_BTN_TEXT_COLOR, NULL, NULL));
 
-            StyleControl(CreateWindow(_T("STATIC"), _T("Border Clr"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 160, y, 70, h, hwnd, NULL, NULL, NULL));
-            hColorBtn2 = CreateWindow(_T("BUTTON"), _T(""), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 230, y, 50, h, hwnd, (HMENU)ID_BTN_OUTLINE_COLOR, NULL, NULL);
+            StyleControl(CreateWindow(_T("STATIC"), _T("FX Color"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 160, y, 70, h, hwnd, NULL, NULL, NULL));
+            hColorBtn2 = HoverButton(CreateWindow(_T("BUTTON"), _T(""), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 230, y, 50, h, hwnd, (HMENU)ID_BTN_OUTLINE_COLOR, NULL, NULL));
+
+            y += gap;
+            // --- Text Effect ---
+            StyleControl(CreateWindow(_T("STATIC"), _T("Effect"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, xL, y, 70, h, hwnd, NULL, NULL, NULL));
+            HWND hFx = StyleControl(CreateWindow(_T("COMBOBOX"), _T(""), WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST, xR, y, 160, 200, hwnd, (HMENU)ID_COMBO_EFFECT, NULL, NULL));
+            SetWindowTheme(hFx, L"DarkMode_CFD", NULL);
+            SendMessage(hFx, CB_ADDSTRING, 0, (LPARAM)L"Outline");
+            SendMessage(hFx, CB_ADDSTRING, 0, (LPARAM)L"Soft Shadow");
+            SendMessage(hFx, CB_ADDSTRING, 0, (LPARAM)L"Glow");
+            SendMessage(hFx, CB_SETCURSEL, Config::effectMode, 0);
 
             y += gap;
             // --- Animation ---
             StyleControl(CreateWindow(_T("STATIC"), _T("Anim Spd"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, xL, y, 70, h, hwnd, NULL, NULL, NULL));
             
             // Slider 0-20 (0.0s - 2.0s)
-            HWND hTrack = CreateWindow(TRACKBAR_CLASS, _T(""), WS_VISIBLE | WS_CHILD | TBS_AUTOTICKS | TBS_ENABLESELRANGE, xR - 10, y, 120, 30, hwnd, (HMENU)ID_TRACK_ANIM_SPEED, NULL, NULL);
+            HWND hTrack = CreateWindow(TRACKBAR_CLASS, _T(""), WS_VISIBLE | WS_CHILD, xR - 10, y, 120, 30, hwnd, (HMENU)ID_TRACK_ANIM_SPEED, NULL, NULL);
             SendMessage(hTrack, TBM_SETRANGE, TRUE, MAKELPARAM(0, 20)); 
             SendMessage(hTrack, TBM_SETPOS, TRUE, Config::animDuration / 100);
 
@@ -674,15 +803,28 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             SetWindowText(hOffY, floatBuf);
 
             y += gap;
-            // --- Time Format (strftime) ---
+            // --- Time Format: preset combo + custom strftime edit ---
             StyleControl(CreateWindow(_T("STATIC"), _T("Format"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, xL, y, 70, h, hwnd, NULL, NULL, NULL));
-            HWND hFmt = StyleControl(CreateWindow(_T("EDIT"), _T(""), WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER, xR, y, 160, h, hwnd, (HMENU)ID_EDIT_TIME_FORMAT, NULL, NULL));
+            HWND hFmtCombo = StyleControl(CreateWindow(_T("COMBOBOX"), _T(""), WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, xR, y, 170, 240, hwnd, (HMENU)ID_COMBO_FORMAT, NULL, NULL));
+            SetWindowTheme(hFmtCombo, L"DarkMode_CFD", NULL);
+            for (int i = 0; i < kNumFormatPresets; ++i)
+                SendMessage(hFmtCombo, CB_ADDSTRING, 0, (LPARAM)kFormatPresets[i].label);
+            SendMessage(hFmtCombo, CB_ADDSTRING, 0, (LPARAM)L"Custom…");
+            int fmtSel = MatchFormatPreset(Config::timeFormat);
+            SendMessage(hFmtCombo, CB_SETCURSEL, fmtSel, 0);
+
+            y += gap;
+            StyleControl(CreateWindow(_T("STATIC"), _T("Custom"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, xL, y, 70, h, hwnd, NULL, NULL, NULL));
+            HWND hFmt = StyleControl(CreateWindow(_T("EDIT"), _T(""), WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER, xR, y, 170, h, hwnd, (HMENU)ID_EDIT_TIME_FORMAT, NULL, NULL));
             SetWindowText(hFmt, Config::timeFormat);
+            // Read-only (not disabled) when a preset is active: stays legible
+            // on the dark theme and the user can still see/copy the format
+            SendMessage(hFmt, EM_SETREADONLY, fmtSel != kNumFormatPresets, 0);
 
             y += gap;
             // --- Opacity ---
             StyleControl(CreateWindow(_T("STATIC"), _T("Opacity"), WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, xL, y, 70, h, hwnd, NULL, NULL, NULL));
-            HWND hOpTrack = CreateWindow(TRACKBAR_CLASS, _T(""), WS_VISIBLE | WS_CHILD | TBS_AUTOTICKS, xR - 10, y, 120, 30, hwnd, (HMENU)ID_TRACK_OPACITY, NULL, NULL);
+            HWND hOpTrack = CreateWindow(TRACKBAR_CLASS, _T(""), WS_VISIBLE | WS_CHILD, xR - 10, y, 120, 30, hwnd, (HMENU)ID_TRACK_OPACITY, NULL, NULL);
             SendMessage(hOpTrack, TBM_SETRANGE, TRUE, MAKELPARAM(20, 100));
             SendMessage(hOpTrack, TBM_SETPOS, TRUE, Config::opacity);
             TCHAR opBuf[16];
@@ -691,9 +833,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
             y += gap + 10;
             // --- Save / Cancel / Reset ---
-            StyleControl(CreateWindow(_T("BUTTON"), _T("Save"), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 10, y, 80, 30, hwnd, (HMENU)ID_BTN_SAVE, NULL, NULL));
-            StyleControl(CreateWindow(_T("BUTTON"), _T("Defaults"), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 100, y, 80, 30, hwnd, (HMENU)ID_BTN_RESET, NULL, NULL));
-            StyleControl(CreateWindow(_T("BUTTON"), _T("Cancel"), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 190, y, 80, 30, hwnd, (HMENU)ID_BTN_CANCEL, NULL, NULL));
+            HoverButton(StyleControl(CreateWindow(_T("BUTTON"), _T("Save"), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 10, y, 80, 30, hwnd, (HMENU)ID_BTN_SAVE, NULL, NULL)));
+            HoverButton(StyleControl(CreateWindow(_T("BUTTON"), _T("Defaults"), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 100, y, 80, 30, hwnd, (HMENU)ID_BTN_RESET, NULL, NULL)));
+            HoverButton(StyleControl(CreateWindow(_T("BUTTON"), _T("Cancel"), WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 190, y, 80, 30, hwnd, (HMENU)ID_BTN_CANCEL, NULL, NULL)));
 
             tempTextColor = Config::textColor;
             tempOutlineColor = Config::outlineColor;
@@ -714,11 +856,52 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             SetBkColor((HDC)wParam, RGB(50, 50, 50)); // Dark Grey Background
             return (INT_PTR)hBrushEdit;
 
+        case WM_CTLCOLORLISTBOX: // Combo dropdown lists
+            SetTextColor((HDC)wParam, RGB(230, 230, 230));
+            SetBkColor((HDC)wParam, RGB(50, 50, 50));
+            return (INT_PTR)hBrushEdit;
+
+        case WM_NOTIFY: {
+            // Custom-draw the trackbars so they match the dark theme:
+            // flat grey channel + accent-blue thumb, no tick marks.
+            LPNMHDR hdr = (LPNMHDR)lParam;
+            if ((hdr->idFrom == ID_TRACK_ANIM_SPEED || hdr->idFrom == ID_TRACK_OPACITY) && hdr->code == NM_CUSTOMDRAW) {
+                LPNMCUSTOMDRAW cd = (LPNMCUSTOMDRAW)lParam;
+                if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
+                    if (cd->dwItemSpec == TBCD_CHANNEL) {
+                        HBRUSH hCh = CreateSolidBrush(RGB(85, 85, 85));
+                        RECT rc = cd->rc;
+                        // Slim the channel to a 4px bar, vertically centered
+                        int mid = (rc.top + rc.bottom) / 2;
+                        rc.top = mid - 2; rc.bottom = mid + 2;
+                        FillRect(cd->hdc, &rc, hCh);
+                        DeleteObject(hCh);
+                        return CDRF_SKIPDEFAULT;
+                    }
+                    if (cd->dwItemSpec == TBCD_THUMB) {
+                        HBRUSH hTh = CreateSolidBrush(RGB(0, 120, 215));
+                        HPEN hOldPen = (HPEN)SelectObject(cd->hdc, GetStockObject(NULL_PEN));
+                        HBRUSH hOldBr = (HBRUSH)SelectObject(cd->hdc, hTh);
+                        RoundRect(cd->hdc, cd->rc.left, cd->rc.top, cd->rc.right + 1, cd->rc.bottom + 1, 6, 6);
+                        SelectObject(cd->hdc, hOldBr);
+                        SelectObject(cd->hdc, hOldPen);
+                        DeleteObject(hTh);
+                        return CDRF_SKIPDEFAULT;
+                    }
+                    if (cd->dwItemSpec == TBCD_TICS) return CDRF_SKIPDEFAULT;
+                }
+            }
+            break;
+        }
+
         case WM_DRAWITEM: {
             LPDRAWITEMSTRUCT pDIS = (LPDRAWITEMSTRUCT)lParam;
             if (pDIS->CtlID == ID_BTN_SAVE) {
-                // Modern Blue Accent
-                COLORREF bg = (pDIS->itemState & ODS_SELECTED) ? RGB(0, 100, 180) : RGB(0, 120, 215);
+                // Modern Blue Accent (lighter on hover, darker when pressed)
+                bool hover = (g_hoverBtn == pDIS->hwndItem);
+                COLORREF bg = (pDIS->itemState & ODS_SELECTED) ? RGB(0, 100, 180)
+                            : hover ? RGB(30, 140, 235) : RGB(0, 120, 215);
                 HBRUSH hBrush = CreateSolidBrush(bg);
                 FillRect(pDIS->hDC, &pDIS->rcItem, hBrush);
                 DeleteObject(hBrush);
@@ -738,8 +921,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                 HBRUSH hBrush = CreateSolidBrush(pDIS->CtlID == ID_BTN_TEXT_COLOR ? tempTextColor : tempOutlineColor);
                 FillRect(pDIS->hDC, &pDIS->rcItem, hBrush);
                 DeleteObject(hBrush);
-                
-                HBRUSH hBorder = CreateSolidBrush(RGB(100, 100, 100)); // Darker border
+
+                bool hover = (g_hoverBtn == pDIS->hwndItem);
+                HBRUSH hBorder = CreateSolidBrush(hover ? RGB(170, 170, 170) : RGB(100, 100, 100));
                 FrameRect(pDIS->hDC, &pDIS->rcItem, hBorder);
                 DeleteObject(hBorder);
                 return TRUE;
@@ -772,6 +956,25 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                  wmId == ID_EDIT_OFFSET_X || wmId == ID_EDIT_OFFSET_Y ||
                  wmId == ID_EDIT_TIME_FORMAT)) {
                 ApplyPreview(hwnd);
+                break;
+            }
+
+            if (HIWORD(wParam) == CBN_SELCHANGE && wmId == ID_COMBO_EFFECT) {
+                if (g_settingsReady) ApplyPreview(hwnd);
+                break;
+            }
+
+            if (HIWORD(wParam) == CBN_SELCHANGE && wmId == ID_COMBO_FORMAT) {
+                int sel = (int)SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
+                HWND hEdit = GetDlgItem(hwnd, ID_EDIT_TIME_FORMAT);
+                if (sel >= 0 && sel < kNumFormatPresets) {
+                    SendMessage(hEdit, EM_SETREADONLY, TRUE, 0);
+                    // SetWindowText fires EN_CHANGE -> ApplyPreview
+                    SetWindowText(hEdit, kFormatPresets[sel].fmt);
+                } else { // Custom…
+                    SendMessage(hEdit, EM_SETREADONLY, FALSE, 0);
+                    SetFocus(hEdit);
+                }
                 break;
             }
 
@@ -873,7 +1076,11 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                     _stprintf(buf, _T("%.1f"), defOffsetY);
                     SetWindowText(GetDlgItem(hwnd, ID_EDIT_OFFSET_Y), buf);
 
+                    SendMessage(GetDlgItem(hwnd, ID_COMBO_FORMAT), CB_SETCURSEL, 0, 0);
+                    SendMessage(GetDlgItem(hwnd, ID_EDIT_TIME_FORMAT), EM_SETREADONLY, TRUE, 0);
                     SetWindowText(GetDlgItem(hwnd, ID_EDIT_TIME_FORMAT), L"%H:%M");
+
+                    SendMessage(GetDlgItem(hwnd, ID_COMBO_EFFECT), CB_SETCURSEL, 0, 0);
 
                     SendMessage(GetDlgItem(hwnd, ID_TRACK_OPACITY), TBM_SETPOS, TRUE, 100);
                     SetWindowText(GetDlgItem(hwnd, ID_STATIC_OPACITY_VAL), _T("100%"));
@@ -919,7 +1126,7 @@ void DoSettingsDialog(HWND parent) {
     
     HWND hDlg = CreateWindowEx(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, CLASS_NAME, _T("EdgeClock Settings"), 
         WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU, 
-        (GetSystemMetrics(SM_CXSCREEN)/2)-150, (GetSystemMetrics(SM_CYSCREEN)/2)-220, 300, 440, parent, NULL, GetModuleHandle(NULL), NULL);
+        (GetSystemMetrics(SM_CXSCREEN)/2)-150, (GetSystemMetrics(SM_CYSCREEN)/2)-260, 300, 520, parent, NULL, GetModuleHandle(NULL), NULL);
     
     // Enable Dark Mode for Title Bar
     BOOL useDarkMode = TRUE;
