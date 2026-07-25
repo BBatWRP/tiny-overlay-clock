@@ -55,8 +55,9 @@ Or run `build.bat`. Requires MinGW with `g++` and `windres`.
 - **RAM Trimming**: Calls `SetProcessWorkingSetSize(-1, -1)` after init and each minute redraw
 
 ## Known Issues / Limitations
-- Clock follows the monitor hosting the taskbar (via `MonitorFromWindow`); no per-monitor user override yet
-- Settings dialog layout is fixed-pixel (not DPI-scaled)
+- Font weight is limited to the styles GDI+ exposes (Regular/Bold/Italic/Bold Italic); Light/Thin requires picking a separate family such as "Segoe UI Light"
+- Fade during slide is always on (not configurable)
+- Localization covers English and Thai only
 
 ## Recent Fixes
 - Log path now resolves next to exe (was relative to CWD)
@@ -85,3 +86,36 @@ Or run `build.bat`. Requires MinGW with `g++` and `windres`.
 - **Left-click tray icon opens Settings**; `WM_DPICHANGED` handled
 - Removed auto-recreation of Start Menu shortcut (installer owns it)
 - `WM_DRAWITEM` button painting deduplicated into `DrawDarkButton`
+
+## v1.6 — Performance rework + UX (2026-07-25)
+**Rendering core** — the expensive GDI+ work is separated from presentation:
+- `BuildClockPath` builds the glyph outline **once** per update; both sizing and
+  drawing use it, and `GetBounds` gives an exact fit (the old code measured with
+  a point-size font but drew with pixel em sizes, so windows were oversized)
+- The rendered text lives in a cached 32bpp DIB (`EnsureSurface`/`RenderClock`);
+  `PresentClock` is a single `UpdateLayeredWindow` that moves, resizes and
+  blends in one call — so slide + fade cost **no** GDI+ work per frame
+- `FontFamily` is cached and rebuilt only when the font name changes
+
+**Wakeups** — `ArmClockTimer` schedules the text timer for the next second/minute
+boundary instead of polling every 1000 ms (60 wakeups/min → 1), drops to
+once-a-minute while hidden, and the logic tick no longer makes cross-process
+shell calls (taskbar edge is derived geometrically; `SHQueryUserNotificationState`
+is throttled to foreground changes or every 5th tick). Timer 1 stops entirely
+while manually hidden. Working set is trimmed when going hidden, after the
+Settings dialog closes, and every 10th minute — not every minute.
+Measured vs v1.5.0, both hidden for 60 s: **CPU 125 ms → 47 ms, working set
+5.2 MB → 0.5 MB**.
+
+**Features**: Pill effect mode, font weight, effect intensity (`fxIntensity`),
+corner selection (4 corners), explicit monitor selection, fade during slide,
+English/Thai localization (`ApplyLanguage`/`L()`), settings export/import
+(UTF-16 key=value file via the tray menu).
+
+**Settings dialog**: DPI-scaled (`QueryDpi`/`DS()` — required because the
+manifest declares PerMonitorV2, so Windows does not scale it for us), two-column
+layout with section headers and separator lines, full keyboard navigation
+(`WS_TABSTOP` + `IsDialogMessage`, Enter→Save, Esc→Cancel, focus rectangles).
+
+**Other**: log file rotates at 32 KB; `ClampConfig` centralises range checks;
+`WM_APP+1` from a second instance now un-hides the clock.

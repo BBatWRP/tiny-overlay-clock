@@ -11,12 +11,19 @@ EdgeClock blends seamlessly into your desktop environment, providing time withou
 * **Edge-Clinging Design**: Snaps perfectly to the bottom-right of your screen, blending into your current workflow.
 * **Multi-Monitor Aware**: Automatically follows the monitor hosting your taskbar.
 * **Smart Auto-Hide**: Slides out of view on hover, when the taskbar is raised (bottom-taskbar aware), or when fullscreen apps run — detected reliably via the Windows shell (D3D games, F11 fullscreen, presentation mode).
-* **Custom Time Format**: Any `strftime` pattern — seconds (`%H:%M:%S`), 12-hour (`%I:%M %p`), or date (`%a %d %H:%M`).
-* **Opacity Control**: Blend the clock into your wallpaper at 20–100% opacity.
+* **Custom Time Format**: Pick a preset (24-hour, 12-hour, with seconds, with date) or write any `strftime` pattern yourself.
+* **Text Effects**: Outline, Soft Shadow, Glow, or a translucent Pill plate — with adjustable strength.
+* **Any Corner, Any Monitor**: Place the clock in any of the four corners, on the monitor of your choice.
+* **Opacity Control**: Blend the clock into your wallpaper at 20–100% opacity, with a fade on every slide.
 * **Live Preview**: Every setting applies instantly as you change it; Cancel restores everything.
-* **Extreme Efficiency**: 
+* **English / ไทย**: The interface follows your Windows language, or you can pick one from the tray menu.
+* **Portable Settings**: Export and import your configuration from the tray menu.
+* **Extreme Efficiency**:
   * Integrates with Windows EcoQoS to minimize CPU impact and battery drain.
-  * Aggressively trims RAM Working Set down to ~1-2 MB after initialization and updates.
+  * Wakes only on the second/minute boundary the display can actually change on — not on a fixed poll.
+  * Animation re-presents a cached surface instead of re-rendering, so sliding and fading cost no drawing work.
+  * Trims its RAM working set down to well under 1 MB while idle.
+  * Measured against v1.5: **~60% less CPU and ~90% less memory** while idle.
 * **Modern Settings Interface**: A dark-themed, sleek configuration dialog to customize your experience.
 * **Fully Customizable**:
   * **Typography**: Select any installed system font and tweak size easily.
