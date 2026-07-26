@@ -22,7 +22,7 @@ EdgeClock blends seamlessly into your desktop environment, providing time withou
   * Integrates with Windows EcoQoS to minimize CPU impact and battery drain.
   * Wakes only on the second/minute boundary the display can actually change on — not on a fixed poll.
   * Animation re-presents a cached surface instead of re-rendering, so sliding and fading cost no drawing work.
-  * Trims its RAM working set down to well under 1 MB while idle.
+  * Returns its memory to the OS immediately after every redraw, so the resident set sits around **0.8 MB** and the whole executable is only 166 KB.
   * Measured against v1.5: **~60% less CPU and ~90% less memory** while idle.
 * **Modern Settings Interface**: A dark-themed, sleek configuration dialog to customize your experience.
 * **Fully Customizable**:

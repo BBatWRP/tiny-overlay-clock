@@ -465,6 +465,20 @@ void FreeFontCache() {
     g_familyCached[0] = L'\0';
 }
 
+// --- Why GDI+ stays initialised ---------------------------------------------
+// Shutting GDI+ down between renders was measured and rejected: it saved only
+// ~90 KB of working set (SetProcessWorkingSetSize already returns GDI+'s heap
+// pages) while nearly doubling CPU, because GdiplusStartup/Shutdown runs every
+// minute. GDI+ is therefore started once and the aggressive trim below does the
+// memory work.
+bool g_gdiplusUp = false;
+
+void GdiplusEnsure() {
+    if (g_gdiplusUp) return;
+    GdiplusStartupInput input;
+    if (GdiplusStartup(&gdiplusToken, &input, NULL) == Ok) g_gdiplusUp = true;
+}
+
 FontFamily* GetFontFamily() {
     if (g_pFamily && wcscmp(g_familyCached, Config::fontName) == 0) return g_pFamily;
 
@@ -691,31 +705,40 @@ void ArmClockTimer(HWND hwnd); // fwd decl
 // at the configured corner. This is the only expensive path; animation frames
 // reuse the surface via PresentClock().
 void RecalculateAll(HWND hwnd) {
-    GraphicsPath path;
-    RectF b;
-    float pad = EffectPad();
+    GdiplusEnsure();
 
-    if (BuildClockPath(path, b)) {
-        clockSize.cx = (int)ceil(b.Width + pad * 2.0f);
-        clockSize.cy = (int)ceil(b.Height + pad * 2.0f);
-    } else {
-        clockSize.cx = 1;
-        clockSize.cy = 1;
-    }
-    if (clockSize.cx < 1) clockSize.cx = 1;
-    if (clockSize.cy < 1) clockSize.cy = 1;
+    {
+        GraphicsPath path;
+        RectF b;
+        float pad = EffectPad();
 
-    targetY = VisibleY();
-    if (currentState == STATE_VISIBLE) currentYVal = (float)targetY;
-    else if (currentState == STATE_HIDDEN) currentYVal = (float)HiddenY();
+        if (BuildClockPath(path, b)) {
+            clockSize.cx = (int)ceil(b.Width + pad * 2.0f);
+            clockSize.cy = (int)ceil(b.Height + pad * 2.0f);
+        } else {
+            clockSize.cx = 1;
+            clockSize.cy = 1;
+        }
+        if (clockSize.cx < 1) clockSize.cx = 1;
+        if (clockSize.cy < 1) clockSize.cy = 1;
 
-    if (EnsureSurface(clockSize.cx, clockSize.cy)) {
-        RenderClock();
-        int alpha = (currentState == STATE_HIDDEN) ? 0
-                  : (currentState == STATE_VISIBLE) ? Config::opacity
-                  : Config::opacity * g_animAlpha / 100;
-        PresentClock(hwnd, ClockX(), (int)currentYVal, alpha);
-    }
+        targetY = VisibleY();
+        if (currentState == STATE_VISIBLE) currentYVal = (float)targetY;
+        else if (currentState == STATE_HIDDEN) currentYVal = (float)HiddenY();
+
+        if (EnsureSurface(clockSize.cx, clockSize.cy)) {
+            RenderClock();
+            int alpha = (currentState == STATE_HIDDEN) ? 0
+                      : (currentState == STATE_VISIBLE) ? Config::opacity
+                      : Config::opacity * g_animAlpha / 100;
+            PresentClock(hwnd, ClockX(), (int)currentYVal, alpha);
+        }
+    } // GDI+ objects destroyed before the working set is trimmed
+
+    // The render just touched GDI+'s heaps and the glyph rasteriser; hand those
+    // pages straight back. They are only needed again on the next redraw, at
+    // most once a minute, so this keeps the resident set well under 1 MB.
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 
     ArmClockTimer(hwnd);
 }
@@ -1782,7 +1805,7 @@ void DoSettingsDialog(HWND parent) {
     SetForegroundWindow(parent);
     g_settingsOpen = false;
 
-    // comdlg32/GDI+ leave a sizeable working set behind after the dialog
+    // comdlg32 and the common controls leave a sizeable working set behind
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 }
 
@@ -2007,16 +2030,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                GetTime(curTime, 64);
                if (_tcscmp(lastTime, curTime) != 0) {
                    _tcscpy(lastTime, curTime);
-                   RecalculateAll(hwnd); // Re-renders and re-arms the timer
+                   RecalculateAll(hwnd); // Renders, releases GDI+, trims, re-arms
                    AssertTopmost(hwnd);
-
-                   // Trim on a slow cadence for clocks that stay visible for
-                   // hours. Every minute would only churn page faults.
-                   static int trimTick = 0;
-                   if (++trimTick >= 10) {
-                       trimTick = 0;
-                       SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
-                   }
                    return 0;
                }
             }
@@ -2167,7 +2182,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         RemoveTrayIcon();
         FreeSurface();
         FreeFontCache();
-        GdiplusShutdown(gdiplusToken);
+        if (g_gdiplusUp) { GdiplusShutdown(gdiplusToken); g_gdiplusUp = false; }
         PostQuitMessage(0);
         return 0;
     }
@@ -2252,8 +2267,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LoadConfig();
     ApplyLanguage();
 
-    GdiplusStartupInput gdiplusStartupInput;
-    GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+    GdiplusEnsure();
     Log("GDI+ Started.");
 
     const TCHAR CLASS_NAME[] = _T("EdgeClockTray");

@@ -2,10 +2,15 @@
 echo Compiling EdgeClock...
 windres EdgeClock.rc -o resource.o
 
-REM -Wall -Wextra is deliberate: the compiler is the cheapest bug finder we
-REM have, and the build is warning-clean, so anything new that appears here is
-REM worth reading. Run check.bat for the stricter pass.
+REM Flag notes (all measured, see CLAUDE.md):
+REM   -Os ... --gc-sections -s   smaller image => fewer resident code pages
+REM   -fno-exceptions -fno-rtti  nothing here throws or uses typeid/dynamic_cast;
+REM                              drops most of the static C++ runtime
+REM   -Wall -Wextra              the tree is warning-clean, so anything new here
+REM                              is worth reading. Run check.bat for more.
 g++ -o EdgeClock.exe EdgeClock.cpp resource.o ^
+    -Os -fno-exceptions -fno-rtti ^
+    -ffunction-sections -fdata-sections -Wl,--gc-sections -s ^
     -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers ^
     -lgdi32 -luser32 -lgdiplus -lcomdlg32 -lole32 -luuid -mwindows -ldwmapi -lcomctl32 -luxtheme -static
 

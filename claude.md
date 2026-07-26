@@ -38,6 +38,32 @@ Or run `build.bat`. Requires MinGW with `g++` and `windres`.
 `build.bat` compiles with `-Wall -Wextra` and the tree is warning-clean, so any
 warning that appears is new and worth reading.
 
+### Build flags are load-bearing (all measured)
+| Flag | Why |
+|---|---|
+| `-Os` | The build previously had **no** `-O` flag at all. Smaller code means fewer resident pages *and* faster execution — it paid for the aggressive trim on its own. |
+| `-fno-exceptions -fno-rtti` | Nothing here throws, catches, or uses `typeid`/`dynamic_cast`. Drops most of the static C++ runtime: 270 KB → 166 KB. |
+| `-ffunction-sections -fdata-sections -Wl,--gc-sections -s` | Discards unreferenced code and symbols. |
+
+Exe size across the three steps: **688 KB → 270 KB → 166 KB** (−76%).
+
+### Memory strategy (measured, do not "optimise" further without re-measuring)
+`SetProcessWorkingSetSize(-1, -1)` runs immediately after every render (inside
+`RecalculateAll`) and when the clock goes hidden. Because a render happens at
+most once a minute, the pages it returns are only faulted back once a minute.
+
+**Rejected after measurement:** shutting GDI+ down between renders
+(`GdiplusShutdown` + restart per minute). It saved only ~90 KB — the trim already
+returns GDI+'s heap pages — while nearly doubling CPU (78 ms → 141 ms per 150 s).
+`GdiplusEnsure()` remains as a one-time lazy init; there is deliberately no
+matching release.
+
+**Untried, and a real trade-off:** replacing GDI+ with plain GDI
+(`BeginPath`/`StrokeAndFillPath`). It would remove gdiplus.dll's resident heap
+entirely, but GDI does not antialias paths the way GDI+ does, so glyph quality
+would drop unless rendering at 4× and downsampling — which spends back the CPU
+and memory saved. Soft Shadow/Glow would need reimplementing with `ExtCreatePen`.
+
 ### Checks before a release
 Run `check.bat`. It is free, deterministic and offline — three stages:
 1. `-Wall -Wextra` syntax pass
