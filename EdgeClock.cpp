@@ -1204,6 +1204,24 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             g_settingsReady = false;
             g_dlgDpi = QueryDpi(hwnd);
 
+            // The finished layout is ~596x466 logical units. At very high
+            // scaling (250%+) that would not fit the work area, and the button
+            // row would fall off the bottom — so cap the scale to what fits.
+            {
+                POINT ptc;
+                GetCursorPos(&ptc);
+                MONITORINFO mic;
+                mic.cbSize = sizeof(mic);
+                if (GetMonitorInfo(MonitorFromPoint(ptc, MONITOR_DEFAULTTOPRIMARY), &mic)) {
+                    int workH = mic.rcWork.bottom - mic.rcWork.top;
+                    int workW = mic.rcWork.right - mic.rcWork.left;
+                    int maxByH = MulDiv(96, workH, 466);
+                    int maxByW = MulDiv(96, workW, 596);
+                    int cap = maxByH < maxByW ? maxByH : maxByW;
+                    if (cap >= 96 && g_dlgDpi > cap) g_dlgDpi = cap;
+                }
+            }
+
             // Snapshot live config for Cancel/revert (live preview writes to Config)
             g_cfgSnapshot.fontSize = Config::fontSize;
             g_cfgSnapshot.outlineWidth = Config::outlineWidth;
@@ -2033,12 +2051,33 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             // (A side or opposite-edge taskbar can never cover us.)
             if (!shouldHide) {
                 static HWND s_hTray = NULL;
-                if (!s_hTray || !IsWindow(s_hTray)) s_hTray = FindWindow(_T("Shell_TrayWnd"), NULL);
-                if (s_hTray) {
-                    RECT rcTray, rcHit;
-                    GetWindowRect(s_hTray, &rcTray);
+                RECT rcTray, rcHit;
+
+                // The cached handle must still exist AND still be the bar on our
+                // monitor — on multi-monitor setups the clock may live on a
+                // display served by a Shell_SecondaryTrayWnd instead.
+                bool ok = s_hTray && IsWindow(s_hTray) &&
+                          GetWindowRect(s_hTray, &rcTray) &&
+                          IntersectRect(&rcHit, &rcTray, &g_mon);
+                if (!ok) {
+                    s_hTray = FindWindow(_T("Shell_TrayWnd"), NULL);
+                    ok = s_hTray && GetWindowRect(s_hTray, &rcTray) &&
+                         IntersectRect(&rcHit, &rcTray, &g_mon);
+                    if (!ok) {
+                        HWND sec = NULL;
+                        while ((sec = FindWindowEx(NULL, sec, _T("Shell_SecondaryTrayWnd"), NULL)) != NULL) {
+                            if (GetWindowRect(sec, &rcTray) && IntersectRect(&rcHit, &rcTray, &g_mon)) {
+                                s_hTray = sec;
+                                ok = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (ok) {
                     bool horizontal = (rcTray.right - rcTray.left) > (rcTray.bottom - rcTray.top);
-                    if (horizontal && IntersectRect(&rcHit, &rcTray, &g_mon)) {
+                    if (horizontal) {
                         int thr = Config::taskbarThreshold;
                         if (ClockAtBottom()) {
                             bool onOurEdge = rcTray.bottom >= g_mon.bottom - thr;
