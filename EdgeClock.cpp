@@ -1090,7 +1090,8 @@ int QueryDpi(HWND hwnd) {
     if (!resolved) {
         resolved = true;
         HMODULE hUser = GetModuleHandle(_T("user32.dll"));
-        if (hUser) pGetDpiForWindow = (GetDpiForWindowFn)GetProcAddress(hUser, "GetDpiForWindow");
+        // Cast through void* — casting FARPROC directly trips -Wcast-function-type
+        if (hUser) pGetDpiForWindow = (GetDpiForWindowFn)(void*)GetProcAddress(hUser, "GetDpiForWindow");
     }
     if (pGetDpiForWindow && hwnd) {
         UINT d = pGetDpiForWindow(hwnd);
@@ -2204,7 +2205,8 @@ void EnableEfficiencyMode() {
     HMODULE hKernel32 = GetModuleHandle(_T("kernel32.dll"));
     if (hKernel32) {
         typedef BOOL (WINAPI *SetProcessInformationFunc)(HANDLE, PROCESS_INFORMATION_CLASS, LPVOID, DWORD);
-        SetProcessInformationFunc pSetProcessInformation = (SetProcessInformationFunc)GetProcAddress(hKernel32, "SetProcessInformation");
+        SetProcessInformationFunc pSetProcessInformation =
+            (SetProcessInformationFunc)(void*)GetProcAddress(hKernel32, "SetProcessInformation");
 
         if (pSetProcessInformation) {
             PROCESS_POWER_THROTTLING_STATE_LOCAL PowerThrottling;

@@ -35,6 +35,22 @@ g++ -o EdgeClock.exe EdgeClock.cpp resource.o -lgdi32 -luser32 -lgdiplus -lcomdl
 ```
 Or run `build.bat`. Requires MinGW with `g++` and `windres`.
 
+`build.bat` compiles with `-Wall -Wextra` and the tree is warning-clean, so any
+warning that appears is new and worth reading.
+
+### Checks before a release
+Run `check.bat`. It is free, deterministic and offline — three stages:
+1. `-Wall -Wextra` syntax pass
+2. stricter pass: `-Wshadow -Wformat=2 -Wnull-dereference -Wcast-align` at `-O2`
+   (`-Wnull-dereference` needs optimisation to see the data flow)
+3. GDI/handle pairing audit (`GetDC`/`ReleaseDC`, `CreateCompatibleDC`/`DeleteDC`,
+   `CreatePopupMenu`/`DestroyMenu` — the last may legitimately differ because
+   `DestroyMenu` recursively frees attached submenus)
+
+Notes: `g++ -fanalyzer` is a no-op here — GCC's static analyzer only supports C,
+not C++. `cppcheck`/`clang-tidy` are not installed on this machine; if added they
+would slot into `check.bat` as a fourth stage.
+
 ### Linked Libraries
 `gdi32`, `user32`, `gdiplus`, `comdlg32`, `ole32`, `uuid`, `dwmapi`, `comctl32` — all statically linked.
 
