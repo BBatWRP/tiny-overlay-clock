@@ -446,8 +446,9 @@ float EffectPad() {
         case 1: // Soft shadow: offset + blur spread
         case 2: // Glow: halo radius
             return Config::outlineWidth * 2.0f + 2.0f;
-        case 3: // Pill: breathing room inside the plate
-            return Config::fontSize * 0.35f + 4.0f;
+        case 3: // Pill: breathing room inside the plate. outlineWidth is folded
+                // in so the "FX Width" control still does something in this mode.
+            return Config::fontSize * 0.30f + Config::outlineWidth + 3.0f;
         default: // Outline stroke
             return Config::outlineWidth;
     }
@@ -472,6 +473,7 @@ void FreeFontCache() {
 // minute. GDI+ is therefore started once and the aggressive trim below does the
 // memory work.
 bool g_gdiplusUp = false;
+extern bool g_settingsOpen; // Defined with the Settings dialog state below
 
 void GdiplusEnsure() {
     if (g_gdiplusUp) return;
@@ -617,17 +619,16 @@ inline BYTE ScaleAlpha(float base) {
     return (BYTE)a;
 }
 
-void RenderClock() {
+// Draws an already-built glyph path into the cached surface. The path is passed
+// in (and mutated in place by the placement transform) so that building the
+// outline — by far the most expensive step — happens exactly once per update.
+void RenderClock(GraphicsPath& path, const RectF& b) {
     if (!g_hdcCache) return;
 
     Graphics graphics(g_hdcCache);
     graphics.SetSmoothingMode(SmoothingModeAntiAlias);
     graphics.SetPixelOffsetMode(PixelOffsetModeHighQuality);
     graphics.Clear(Color(0, 0, 0, 0)); // Fully transparent
-
-    GraphicsPath path;
-    RectF b;
-    if (!BuildClockPath(path, b)) return;
 
     // Shift the ink so it sits inset by pad on every side
     float pad = EffectPad();
@@ -690,9 +691,13 @@ void RenderClock() {
             break;
         }
         default: { // Outline (classic)
-            Pen pen(Color(ScaleAlpha(255.0f), fxR, fxG, fxB), (REAL)Config::outlineWidth);
-            pen.SetLineJoin(LineJoinRound);
-            graphics.DrawPath(&pen, &path);
+            // A pen width of 0 means "hairline" to GDI+, so an outline width of
+            // zero would still paint a 1px border. Honour "no outline" instead.
+            if (Config::outlineWidth > 0.0f) {
+                Pen pen(Color(ScaleAlpha(255.0f), fxR, fxG, fxB), (REAL)Config::outlineWidth);
+                pen.SetLineJoin(LineJoinRound);
+                graphics.DrawPath(&pen, &path);
+            }
             graphics.FillPath(&brush, &path);
             break;
         }
@@ -712,7 +717,8 @@ void RecalculateAll(HWND hwnd) {
         RectF b;
         float pad = EffectPad();
 
-        if (BuildClockPath(path, b)) {
+        bool built = BuildClockPath(path, b);
+        if (built) {
             clockSize.cx = (int)ceil(b.Width + pad * 2.0f);
             clockSize.cy = (int)ceil(b.Height + pad * 2.0f);
         } else {
@@ -726,8 +732,8 @@ void RecalculateAll(HWND hwnd) {
         if (currentState == STATE_VISIBLE) currentYVal = (float)targetY;
         else if (currentState == STATE_HIDDEN) currentYVal = (float)HiddenY();
 
-        if (EnsureSurface(clockSize.cx, clockSize.cy)) {
-            RenderClock();
+        if (built && EnsureSurface(clockSize.cx, clockSize.cy)) {
+            RenderClock(path, b); // Reuses the path built above — no second build
             int alpha = (currentState == STATE_HIDDEN) ? 0
                       : (currentState == STATE_VISIBLE) ? Config::opacity
                       : Config::opacity * g_animAlpha / 100;
@@ -738,7 +744,10 @@ void RecalculateAll(HWND hwnd) {
     // The render just touched GDI+'s heaps and the glyph rasteriser; hand those
     // pages straight back. They are only needed again on the next redraw, at
     // most once a minute, so this keeps the resident set well under 1 MB.
-    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+    // Skipped during live preview: the Settings dialog re-renders on every
+    // keystroke, and emptying the working set each time only churns faults.
+    if (!g_settingsOpen)
+        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 
     ArmClockTimer(hwnd);
 }
@@ -1891,6 +1900,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         RecalculateAll(hwnd);
         return 0;
 
+    case WM_TIMECHANGE:
+        // Clock set by the user, NTP or a DST shift: the pending timer was armed
+        // against the old time, so redraw and re-arm against the new one.
+        RecalculateAll(hwnd);
+        return 0;
+
     case WM_TRAYICON:
         if (lParam == WM_RBUTTONUP) {
             ShowContextMenu(hwnd);
@@ -1985,9 +2000,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 currentYVal = animStartY + (endY - animStartY) * eased;
                 animating = true;
 
-                // Cross-fade alongside the slide: in on the way up, out on the
-                // way down. Free, because the surface is already rendered.
-                float fade = (currentState == STATE_SLIDING_UP) ? eased : (1.0f - eased);
+                // Cross-fade alongside the slide, derived from POSITION rather
+                // than progress: if a slide reverses mid-flight the alpha stays
+                // continuous instead of snapping back to the start of the ramp.
+                float hidY = (float)HiddenY();
+                float span = (float)targetY - hidY;
+                float fade = (span != 0.0f) ? (currentYVal - hidY) / span : 1.0f;
+                if (fade < 0.0f) fade = 0.0f;
+                if (fade > 1.0f) fade = 1.0f;
                 g_animAlpha = (int)(fade * 100.0f);
 
                 if (progress >= 1.0f) {
