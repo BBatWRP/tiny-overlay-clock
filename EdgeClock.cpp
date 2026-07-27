@@ -1856,12 +1856,205 @@ void ArmClockTimer(HWND hwnd) {
     SetTimer(hwnd, 2, delay, NULL);
 }
 
+// --- Event-driven visibility -------------------------------------------------
+// Most of what decides whether the clock hides — the foreground window and the
+// taskbar sliding in and out — is something Windows can tell us about, so we
+// listen for those instead of asking 200 times a minute. A timer still runs as
+// a safety net (a missed event must never leave the clock stranded over a
+// fullscreen app) and to watch the mouse, which a click-through window cannot
+// be notified about. Its interval adapts to how close the cursor is.
+HWND g_hwndMain = NULL;
+HWINEVENTHOOK g_hookForeground = NULL;
+HWINEVENTHOOK g_hookTaskbar = NULL;
+
+void EvaluateVisibility(HWND hwnd); // fwd decl
+
+// Picks the safety-net interval: snappy when the cursor is near the clock,
+// relaxed otherwise, and slowest of all while the clock is already hidden.
+void ArmLogicTimer(HWND hwnd) {
+    UINT interval;
+    POINT pt;
+    if (GetCursorPos(&pt)) {
+        const int NEAR_PX = 200;
+        int x = ClockX(), y = targetY;
+        int dx = (pt.x < x) ? x - pt.x : (pt.x > x + clockSize.cx ? pt.x - x - clockSize.cx : 0);
+        int dy = (pt.y < y) ? y - pt.y : (pt.y > y + clockSize.cy ? pt.y - y - clockSize.cy : 0);
+        bool nearClock = (dx < NEAR_PX && dy < NEAR_PX);
+        interval = nearClock ? 120 : (currentState == STATE_HIDDEN ? 1000 : 500);
+    } else {
+        interval = 500;
+    }
+    SetTimer(hwnd, 1, interval, NULL);
+}
+
+// Decides whether the clock should be hidden and starts the matching
+// slide. Driven both by the safety-net timer and by the WinEvent hooks,
+// so it must stay cheap.
+void EvaluateVisibility(HWND hwnd) {
+        // Manually hidden and already parked: nothing can change this until
+        // the user toggles it back, so stop polling entirely.
+        if (manualHidden && currentState == STATE_HIDDEN) {
+            KillTimer(hwnd, 1);
+            return;
+        }
+
+        bool shouldHide = manualHidden;
+
+        // Mouse Hover Check (Check against the visible position to prevent flickering)
+        if (!shouldHide) {
+            POINT ptMouse;
+            GetCursorPos(&ptMouse);
+            int clkX = ClockX();
+            int clkY = targetY; // Use targetY (visible position)
+            if (ptMouse.x >= clkX && ptMouse.x <= clkX + clockSize.cx &&
+                ptMouse.y >= clkY && ptMouse.y <= clkY + clockSize.cy) {
+                shouldHide = true;
+            }
+        }
+
+        // Taskbar check — purely geometric so this costs no cross-process
+        // calls: the bar must be a horizontal one, sitting on the same
+        // monitor and the same edge as the clock, and actually raised.
+        // (A side or opposite-edge taskbar can never cover us.)
+        if (!shouldHide) {
+            static HWND s_hTray = NULL;
+            RECT rcTray, rcHit;
+
+            // The cached handle must still exist AND still be the bar on our
+            // monitor — on multi-monitor setups the clock may live on a
+            // display served by a Shell_SecondaryTrayWnd instead.
+            bool ok = s_hTray && IsWindow(s_hTray) &&
+                      GetWindowRect(s_hTray, &rcTray) &&
+                      IntersectRect(&rcHit, &rcTray, &g_mon);
+            if (!ok) {
+                s_hTray = FindWindow(_T("Shell_TrayWnd"), NULL);
+                ok = s_hTray && GetWindowRect(s_hTray, &rcTray) &&
+                     IntersectRect(&rcHit, &rcTray, &g_mon);
+                if (!ok) {
+                    HWND sec = NULL;
+                    while ((sec = FindWindowEx(NULL, sec, _T("Shell_SecondaryTrayWnd"), NULL)) != NULL) {
+                        if (GetWindowRect(sec, &rcTray) && IntersectRect(&rcHit, &rcTray, &g_mon)) {
+                            s_hTray = sec;
+                            ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (ok) {
+                bool horizontal = (rcTray.right - rcTray.left) > (rcTray.bottom - rcTray.top);
+                if (horizontal) {
+                    int thr = Config::taskbarThreshold;
+                    if (ClockAtBottom()) {
+                        bool onOurEdge = rcTray.bottom >= g_mon.bottom - thr;
+                        if (onOurEdge && rcTray.top < g_mon.bottom - thr) shouldHide = true;
+                    } else {
+                        bool onOurEdge = rcTray.top <= g_mon.top + thr;
+                        if (onOurEdge && rcTray.bottom > g_mon.top + thr) shouldHide = true;
+                    }
+                }
+            }
+        }
+
+        // Fullscreen / presentation detection via the shell (robust for
+        // D3D games, F11 fullscreen, presentation mode). This is a
+        // cross-process call, so it only runs when the foreground window
+        // changed or every 5th tick (~1.5s) to catch in-place F11 toggles.
+        if (!shouldHide) {
+            static HWND s_lastFore = NULL;
+            static int s_qunsTick = 0;
+            static bool s_qunsHide = false;
+
+            HWND hFore = GetForegroundWindow();
+            if (hFore != s_lastFore || ++s_qunsTick >= 5) {
+                s_lastFore = hFore;
+                s_qunsTick = 0;
+                s_qunsHide = false;
+                QUERY_USER_NOTIFICATION_STATE quns;
+                if (SUCCEEDED(SHQueryUserNotificationState(&quns))) {
+                    s_qunsHide = (quns == QUNS_RUNNING_D3D_FULL_SCREEN ||
+                                  quns == QUNS_PRESENTATION_MODE ||
+                                  quns == QUNS_BUSY);
+                }
+            }
+            if (s_qunsHide) shouldHide = true;
+        }
+
+        // Fallback: foreground window exactly covering its own monitor
+        if (!shouldHide) {
+            HWND hFore = GetForegroundWindow();
+            if (hFore) {
+                RECT rc;
+                GetWindowRect(hFore, &rc);
+                HMONITOR hMon = MonitorFromWindow(hFore, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi = { sizeof(mi) };
+                if (GetMonitorInfo(hMon, &mi) && EqualRect(&rc, &mi.rcMonitor)) {
+                     TCHAR cName[256];
+                     GetClassName(hFore, cName, 256);
+                     if (_tcscmp(cName, _T("Progman")) != 0 && _tcscmp(cName, _T("WorkerW")) != 0 && _tcscmp(cName, _T("Shell_TrayWnd")) != 0) {
+                         shouldHide = true;
+                     }
+                }
+            }
+        }
+
+        // Perform logic check (should we hide?)
+        if (shouldHide) {
+            if (currentState == STATE_VISIBLE || currentState == STATE_SLIDING_UP) {
+                StartSlide(hwnd, STATE_SLIDING_DOWN);
+            }
+        } else {
+            if (currentState == STATE_HIDDEN || currentState == STATE_SLIDING_DOWN) {
+                StartSlide(hwnd, STATE_SLIDING_UP);
+            }
+        }
+}
+
+void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
+                           LONG idObject, LONG, DWORD, DWORD) {
+    if (!g_hwndMain) return;
+    // LOCATIONCHANGE also fires for carets and the mouse cursor; only whole
+    // windows moving can uncover or cover the clock.
+    if (event == EVENT_OBJECT_LOCATIONCHANGE && (idObject != OBJID_WINDOW || !hwnd)) return;
+    EvaluateVisibility(g_hwndMain);
+}
+
+// The taskbar hook is scoped to explorer's tray thread so we are not woken by
+// every window move on the system.
+void InstallVisibilityHooks(HWND hwnd) {
+    g_hwndMain = hwnd;
+
+    if (!g_hookForeground) {
+        g_hookForeground = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                                          NULL, WinEventProc, 0, 0,
+                                          WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+
+    if (g_hookTaskbar) { UnhookWinEvent(g_hookTaskbar); g_hookTaskbar = NULL; }
+    HWND hTray = FindWindow(_T("Shell_TrayWnd"), NULL);
+    if (hTray) {
+        DWORD pid = 0;
+        DWORD tid = GetWindowThreadProcessId(hTray, &pid);
+        g_hookTaskbar = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
+                                        NULL, WinEventProc, pid, tid,
+                                        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+}
+
+void RemoveVisibilityHooks() {
+    if (g_hookForeground) { UnhookWinEvent(g_hookForeground); g_hookForeground = NULL; }
+    if (g_hookTaskbar) { UnhookWinEvent(g_hookTaskbar); g_hookTaskbar = NULL; }
+    g_hwndMain = NULL;
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     // Re-add tray icon when Explorer restarts (icon is lost otherwise)
     if (g_msgTaskbarCreated && uMsg == g_msgTaskbarCreated) {
         Shell_NotifyIcon(NIM_ADD, &nid);
         UpdateScreenMetrics();
         RecalculateAll(hwnd);
+        InstallVisibilityHooks(hwnd); // Explorer restarted: re-scope the tray hook
         return 0;
     }
 
@@ -1878,7 +2071,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         InitTrayIcon(hwnd);
 
-        SetTimer(hwnd, 1, 300, NULL);
+        InstallVisibilityHooks(hwnd);
+        ArmLogicTimer(hwnd);
         ArmClockTimer(hwnd);
 
         // Trim RAM after initialization
@@ -1944,8 +2138,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 break;
             case ID_MENU_TOGGLE_HIDE:
                 manualHidden = !manualHidden;
-                // Restart the poll timer (it stops itself while manually hidden)
-                SetTimer(hwnd, 1, 300, NULL);
+                // Restart the safety net (it stops itself while manually hidden)
+                ArmLogicTimer(hwnd);
+                EvaluateVisibility(hwnd);
                 break;
             case ID_LANG_AUTO:
             case ID_LANG_EN:
@@ -2059,125 +2254,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
 
-        if (wParam == 1) { // Visibility logic
-            // Manually hidden and already parked: nothing can change this until
-            // the user toggles it back, so stop polling entirely.
-            if (manualHidden && currentState == STATE_HIDDEN) {
-                KillTimer(hwnd, 1);
-                return 0;
-            }
-
-            bool shouldHide = manualHidden;
-
-            // Mouse Hover Check (Check against the visible position to prevent flickering)
-            if (!shouldHide) {
-                POINT ptMouse;
-                GetCursorPos(&ptMouse);
-                int clkX = ClockX();
-                int clkY = targetY; // Use targetY (visible position)
-                if (ptMouse.x >= clkX && ptMouse.x <= clkX + clockSize.cx &&
-                    ptMouse.y >= clkY && ptMouse.y <= clkY + clockSize.cy) {
-                    shouldHide = true;
-                }
-            }
-
-            // Taskbar check — purely geometric so this costs no cross-process
-            // calls: the bar must be a horizontal one, sitting on the same
-            // monitor and the same edge as the clock, and actually raised.
-            // (A side or opposite-edge taskbar can never cover us.)
-            if (!shouldHide) {
-                static HWND s_hTray = NULL;
-                RECT rcTray, rcHit;
-
-                // The cached handle must still exist AND still be the bar on our
-                // monitor — on multi-monitor setups the clock may live on a
-                // display served by a Shell_SecondaryTrayWnd instead.
-                bool ok = s_hTray && IsWindow(s_hTray) &&
-                          GetWindowRect(s_hTray, &rcTray) &&
-                          IntersectRect(&rcHit, &rcTray, &g_mon);
-                if (!ok) {
-                    s_hTray = FindWindow(_T("Shell_TrayWnd"), NULL);
-                    ok = s_hTray && GetWindowRect(s_hTray, &rcTray) &&
-                         IntersectRect(&rcHit, &rcTray, &g_mon);
-                    if (!ok) {
-                        HWND sec = NULL;
-                        while ((sec = FindWindowEx(NULL, sec, _T("Shell_SecondaryTrayWnd"), NULL)) != NULL) {
-                            if (GetWindowRect(sec, &rcTray) && IntersectRect(&rcHit, &rcTray, &g_mon)) {
-                                s_hTray = sec;
-                                ok = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if (ok) {
-                    bool horizontal = (rcTray.right - rcTray.left) > (rcTray.bottom - rcTray.top);
-                    if (horizontal) {
-                        int thr = Config::taskbarThreshold;
-                        if (ClockAtBottom()) {
-                            bool onOurEdge = rcTray.bottom >= g_mon.bottom - thr;
-                            if (onOurEdge && rcTray.top < g_mon.bottom - thr) shouldHide = true;
-                        } else {
-                            bool onOurEdge = rcTray.top <= g_mon.top + thr;
-                            if (onOurEdge && rcTray.bottom > g_mon.top + thr) shouldHide = true;
-                        }
-                    }
-                }
-            }
-
-            // Fullscreen / presentation detection via the shell (robust for
-            // D3D games, F11 fullscreen, presentation mode). This is a
-            // cross-process call, so it only runs when the foreground window
-            // changed or every 5th tick (~1.5s) to catch in-place F11 toggles.
-            if (!shouldHide) {
-                static HWND s_lastFore = NULL;
-                static int s_qunsTick = 0;
-                static bool s_qunsHide = false;
-
-                HWND hFore = GetForegroundWindow();
-                if (hFore != s_lastFore || ++s_qunsTick >= 5) {
-                    s_lastFore = hFore;
-                    s_qunsTick = 0;
-                    s_qunsHide = false;
-                    QUERY_USER_NOTIFICATION_STATE quns;
-                    if (SUCCEEDED(SHQueryUserNotificationState(&quns))) {
-                        s_qunsHide = (quns == QUNS_RUNNING_D3D_FULL_SCREEN ||
-                                      quns == QUNS_PRESENTATION_MODE ||
-                                      quns == QUNS_BUSY);
-                    }
-                }
-                if (s_qunsHide) shouldHide = true;
-            }
-
-            // Fallback: foreground window exactly covering its own monitor
-            if (!shouldHide) {
-                HWND hFore = GetForegroundWindow();
-                if (hFore) {
-                    RECT rc;
-                    GetWindowRect(hFore, &rc);
-                    HMONITOR hMon = MonitorFromWindow(hFore, MONITOR_DEFAULTTONEAREST);
-                    MONITORINFO mi = { sizeof(mi) };
-                    if (GetMonitorInfo(hMon, &mi) && EqualRect(&rc, &mi.rcMonitor)) {
-                         TCHAR cName[256];
-                         GetClassName(hFore, cName, 256);
-                         if (_tcscmp(cName, _T("Progman")) != 0 && _tcscmp(cName, _T("WorkerW")) != 0 && _tcscmp(cName, _T("Shell_TrayWnd")) != 0) {
-                             shouldHide = true;
-                         }
-                    }
-                }
-            }
-
-            // Perform logic check (should we hide?)
-            if (shouldHide) {
-                if (currentState == STATE_VISIBLE || currentState == STATE_SLIDING_UP) {
-                    StartSlide(hwnd, STATE_SLIDING_DOWN);
-                }
-            } else {
-                if (currentState == STATE_HIDDEN || currentState == STATE_SLIDING_DOWN) {
-                    StartSlide(hwnd, STATE_SLIDING_UP);
-                }
-            }
+        if (wParam == 1) { // Visibility safety net
+            EvaluateVisibility(hwnd);
+            // EvaluateVisibility stops the timer once the clock is parked by the
+            // user; re-arming unconditionally here would defeat that.
+            if (!(manualHidden && currentState == STATE_HIDDEN)) ArmLogicTimer(hwnd);
             return 0;
         }
         return 0;
@@ -2194,11 +2275,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_APP + 1:
         // A second instance was launched — treat it as "show me"
         manualHidden = false;
-        SetTimer(hwnd, 1, 300, NULL);
+        ArmLogicTimer(hwnd);
+        EvaluateVisibility(hwnd);
         AssertTopmost(hwnd);
         return 0;
 
     case WM_DESTROY:
+        RemoveVisibilityHooks();
         RemoveTrayIcon();
         FreeSurface();
         FreeFontCache();
