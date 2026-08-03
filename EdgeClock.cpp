@@ -518,10 +518,18 @@ INT FontStyleFor(FontFamily* fam) {
 // Builds the glyph outline for the current time at the origin and returns its
 // tight bounds. Both sizing and rendering use this single path, so the window
 // is exactly as large as the ink plus effect padding (no wasted blit area).
-bool BuildClockPath(GraphicsPath& path, RectF& bounds) {
+// textOut receives the exact string that went into the path. The caller records
+// it as "what is currently on screen", so it must come from this one GetTime()
+// call — sampling the clock a second time could straddle a second boundary and
+// leave the cache claiming a string that was never drawn.
+bool BuildClockPath(GraphicsPath& path, RectF& bounds, TCHAR* textOut, int textCap) {
     TCHAR timeBuf[64];
     GetTime(timeBuf, 64);
     if (!timeBuf[0]) return false;
+    if (textOut && textCap > 0) {
+        _tcsncpy(textOut, timeBuf, textCap - 1);
+        textOut[textCap - 1] = _T('\0');
+    }
 
     FontFamily* fam = GetFontFamily();
     StringFormat format(StringFormat::GenericTypographic());
@@ -706,6 +714,12 @@ void RenderClock(GraphicsPath& path, const RectF& b) {
 
 void ArmClockTimer(HWND hwnd); // fwd decl
 
+// The time string currently painted into the cached surface — i.e. what the
+// user is actually looking at. Owned by RecalculateAll(), the only function
+// that draws, so it can never drift from the pixels the way a caller-side
+// "last time I saw" copy can. Empty means "nothing valid on screen".
+TCHAR g_lastRendered[64] = {0};
+
 // Re-measures the text, resizes the cached surface, redraws it and presents it
 // at the configured corner. This is the only expensive path; animation frames
 // reuse the surface via PresentClock().
@@ -717,7 +731,8 @@ void RecalculateAll(HWND hwnd) {
         RectF b;
         float pad = EffectPad();
 
-        bool built = BuildClockPath(path, b);
+        TCHAR drawn[64] = {0};
+        bool built = BuildClockPath(path, b, drawn, 64);
         if (built) {
             clockSize.cx = (int)ceil(b.Width + pad * 2.0f);
             clockSize.cy = (int)ceil(b.Height + pad * 2.0f);
@@ -732,14 +747,30 @@ void RecalculateAll(HWND hwnd) {
         if (currentState == STATE_VISIBLE) currentYVal = (float)targetY;
         else if (currentState == STATE_HIDDEN) currentYVal = (float)HiddenY();
 
+        bool shown = false;
         if (built && EnsureSurface(clockSize.cx, clockSize.cy)) {
             RenderClock(path, b); // Reuses the path built above — no second build
             int alpha = (currentState == STATE_HIDDEN) ? 0
                       : (currentState == STATE_VISIBLE) ? Config::opacity
                       : Config::opacity * g_animAlpha / 100;
             PresentClock(hwnd, ClockX(), (int)currentYVal, alpha);
+            shown = true;
         }
+
+        // Only claim a string is on screen once it really was drawn. A failed
+        // build (bad font, empty format) leaves the cache empty so the next
+        // tick retries instead of concluding "nothing changed" for a minute.
+        if (shown) _tcscpy(g_lastRendered, drawn);
+        else       g_lastRendered[0] = _T('\0');
     } // GDI+ objects destroyed before the working set is trimmed
+
+    // Hidden means the surface is parked off-screen where nobody can see it,
+    // and StartSlide() rebuilds it on the way back in. Holding its DIB for the
+    // whole idle period buys nothing, so give it back before trimming.
+    if (currentState == STATE_HIDDEN) {
+        FreeSurface();
+        g_lastRendered[0] = _T('\0');
+    }
 
     // The render just touched GDI+'s heaps and the glyph rasteriser; hand those
     // pages straight back. They are only needed again on the next redraw, at
@@ -750,6 +781,22 @@ void RecalculateAll(HWND hwnd) {
         SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 
     ArmClockTimer(hwnd);
+}
+
+// Brings the on-screen text up to date, doing the expensive render only when it
+// would actually change something. Two things make that check reliable:
+// g_lastRendered is written by the render path itself, and it is empty whenever
+// the surface is gone — so a clock coming back from hidden always redraws.
+// Returns true if a render happened.
+bool RefreshClockText(HWND hwnd) {
+    if (currentState == STATE_HIDDEN) return false; // Nothing visible to correct
+
+    TCHAR cur[64];
+    GetTime(cur, 64);
+    if (g_hdcCache && _tcscmp(g_lastRendered, cur) == 0) return false;
+
+    RecalculateAll(hwnd);
+    return true;
 }
 
 void InitTrayIcon(HWND hwnd) {
@@ -1823,10 +1870,21 @@ void DoSettingsDialog(HWND parent) {
 // time/position for the time-based interpolation in the animation timer.
 void StartSlide(HWND hwnd, AnimState newState) {
     currentState = newState;
+
+    // Coming back into view: the cached surface still holds whatever the time
+    // was when we hid, and no text timer ran while hidden. Redraw NOW rather
+    // than arming a timer — arming alone was the old behaviour and it meant the
+    // clock slid in showing a stale minute for up to a full minute.
+    // RefreshClockText is a no-op when the text has not actually changed, so a
+    // quick hover in and out still costs no GDI+ work.
+    if (newState == STATE_SLIDING_UP) {
+        RefreshClockText(hwnd);
+        ArmClockTimer(hwnd); // Resume boundary ticks (killed while hidden)
+    }
+
     animStartTick = GetTickCount64();
     animStartY = currentYVal;
     SetTimer(hwnd, 3, Config::refreshRate, NULL);
-    if (newState == STATE_SLIDING_UP) ArmClockTimer(hwnd); // Refresh text on the way in
 }
 
 // Re-asserts topmost z-order. PresentClock() moves the window without touching
@@ -1843,17 +1901,36 @@ inline bool FormatHasSeconds() { return wcsstr(Config::timeFormat, L"%S") != NUL
 // minute otherwise. Compared to polling every second this drops the idle wakeup
 // rate to once per minute, and the text never lags the real clock.
 void ArmClockTimer(HWND hwnd) {
+    // Hidden: nothing is on screen to keep current, and the surface has been
+    // freed. StartSlide() redraws on the way back in, so stop waking at all
+    // instead of firing once a minute to do nothing.
+    if (currentState == STATE_HIDDEN) {
+        KillTimer(hwnd, 2);
+        return;
+    }
+
     SYSTEMTIME st;
     GetLocalTime(&st);
 
-    // While hidden the text is invisible, so only wake once a minute
-    bool seconds = FormatHasSeconds() && currentState != STATE_HIDDEN;
+    // Per-second ticks only in the states where WM_TIMER 2 actually redraws.
+    bool seconds = FormatHasSeconds() &&
+                   (currentState == STATE_VISIBLE || currentState == STATE_SLIDING_UP);
 
-    UINT delay = seconds ? (1000 - st.wMilliseconds)
-                         : ((60 - st.wSecond) * 1000 - st.wMilliseconds);
-    delay += 20;                 // Land just past the boundary
-    if (delay < 50) delay = 50;  // Never spin
-    SetTimer(hwnd, 2, delay, NULL);
+    // Signed arithmetic on purpose. wSecond is 0-59 normally but Windows reports
+    // 60 during a leap second when leap-second support is on; as UINT that made
+    // (60 - 60) * 1000 - wMilliseconds wrap to ~4.29e9, which SetTimer clamps to
+    // USER_TIMER_MAXIMUM — a 24-day freeze. Clamped both ends now, so the worst
+    // any arithmetic slip here can cost is one late tick.
+    int delay = seconds ? (1000 - (int)st.wMilliseconds)
+                        : ((60 - (int)st.wSecond) * 1000 - (int)st.wMilliseconds);
+    delay += 35;                          // Land past the boundary, clear of the
+                                          // ~15.6 ms timer granularity
+    if (delay < 50) delay = 50;           // Never spin
+    if (delay > 61000) delay = 61000;     // Never sleep past the next minute.
+                                          // The largest legitimate value is
+                                          // 60035, so this only ever catches a
+                                          // slip, never a real boundary.
+    SetTimer(hwnd, 2, (UINT)delay, NULL);
 }
 
 // --- Event-driven visibility -------------------------------------------------
@@ -2100,6 +2177,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         RecalculateAll(hwnd);
         return 0;
 
+    case WM_POWERBROADCAST:
+        // Resume from sleep. WM_TIMER 2 was armed against pre-sleep ticks and
+        // under IDLE priority + EcoQoS its delivery can lag, so correct the text
+        // now instead of showing pre-sleep time while the timer catches up.
+        if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+            if (RefreshClockText(hwnd)) AssertTopmost(hwnd);
+            ArmClockTimer(hwnd);
+            EvaluateVisibility(hwnd);
+        }
+        return TRUE;
+
     case WM_TRAYICON:
         if (lParam == WM_RBUTTONUP) {
             ShowContextMenu(hwnd);
@@ -2171,6 +2259,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_TIMER: {
         if (wParam == 3) { // Animation Timer
             bool animating = false;
+            bool parked = false; // Slide-down just finished; release after presenting
 
             // TIME-BASED ANIMATION with ease-out cubic.
             // Progress derives from wall-clock elapsed time, so the slide
@@ -2211,14 +2300,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     currentState = wasUp ? STATE_VISIBLE : STATE_HIDDEN;
                     g_animAlpha = wasUp ? 100 : 0;
                     KillTimer(hwnd, 3);
-                    if (wasUp) {
-                        AssertTopmost(hwnd);
-                    } else {
-                        ArmClockTimer(hwnd); // Drop to once-a-minute while hidden
-                        // Going idle: give the working set back to the OS. Pages
-                        // are only needed again on the next redraw (<=1/min).
-                        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
-                    }
+                    if (wasUp) AssertTopmost(hwnd);
+                    else       parked = true;
                 }
             } else if (currentState == STATE_VISIBLE) {
                  if ((int)currentYVal != targetY) {
@@ -2235,21 +2318,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 PresentClock(hwnd, ClockX(), (int)currentYVal,
                              Config::opacity * g_animAlpha / 100);
             }
+
+            // Strictly after the present above: FreeSurface() first would turn
+            // that PresentClock into a no-op and strand the clock one frame
+            // short of hidden.
+            if (parked) {
+                ArmClockTimer(hwnd); // Hidden — stops the text timer entirely
+                FreeSurface();       // The DIB is the bulk of the idle footprint
+                g_lastRendered[0] = _T('\0');
+                SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+            }
             return 0;
         }
 
         if (wParam == 2) { // Clock text update (fires on the second/minute boundary)
-            if (currentState == STATE_VISIBLE || currentState == STATE_SLIDING_UP) {
-               static TCHAR lastTime[64] = {0};
-               TCHAR curTime[64];
-               GetTime(curTime, 64);
-               if (_tcscmp(lastTime, curTime) != 0) {
-                   _tcscpy(lastTime, curTime);
-                   RecalculateAll(hwnd); // Renders, releases GDI+, trims, re-arms
-                   AssertTopmost(hwnd);
-                   return 0;
-               }
-            }
+            if (RefreshClockText(hwnd)) AssertTopmost(hwnd);
+            // Re-armed unconditionally and last, so no path out of this handler
+            // can leave the clock with no pending tick. ArmClockTimer stops the
+            // timer by itself when hidden.
             ArmClockTimer(hwnd);
             return 0;
         }

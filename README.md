@@ -22,7 +22,8 @@ EdgeClock blends seamlessly into your desktop environment, providing time withou
   * Integrates with Windows EcoQoS to minimize CPU impact and battery drain.
   * Wakes only on the second/minute boundary the display can actually change on — not on a fixed poll.
   * Animation re-presents a cached surface instead of re-rendering, so sliding and fading cost no drawing work.
-  * Returns its memory to the OS immediately after every redraw, so the resident set sits around **0.8 MB** and the whole executable is only 166 KB.
+  * While hidden it stops keeping time altogether — there is nothing on screen to keep current, so the clock redraws on the way back into view instead. Hidden by the tray menu, it runs **no timers at all** and sleeps until you ask for it back.
+  * Returns its memory to the OS immediately after every redraw, and releases the render surface itself while hidden, so the resident set sits around **0.8 MB** and the whole executable is only 166 KB.
   * Measured against v1.5: **~60% less CPU and ~90% less memory** while idle.
 * **Modern Settings Interface**: A dark-themed, sleek configuration dialog to customize your experience.
 * **Fully Customizable**:
@@ -55,13 +56,17 @@ graph TD
     E --> F[Initialize GDI+ & System Tray]
     F --> G[Message Loop & Timers]
     
-    G -->|Timer 1s| H[Update Time]
-    G -->|Timer 300ms| I[Check Window Status & Mouse Hover]
+    G -->|Armed to next boundary| H[Update Time]
+    G -->|Adaptive 120-1000ms| I[Check Window Status & Mouse Hover]
     G -->|Timer 10ms| J[Process Smooth Slide Animation]
+    G -->|WinEvent hooks| I
     
     H --> K[Update Layered Window Content]
     I -- Collision Detected --> L[Trigger Slide Down]
     I -- Area Clear --> M[Trigger Slide Up]
+    
+    L --> S[Park: stop clock timer \n free surface]
+    M --> T[Redraw before it is seen]
     
     K --> N[SetProcessWorkingSetSize \n Trim RAM]
     

@@ -21,9 +21,25 @@ This is a **single-file Win32 application** (`EdgeClock.cpp`, ~1090 lines). All 
 | `WinMain` | 1020–1089 | Entry point: single-instance mutex, init, message loop |
 
 ### Timer System
-- **Timer 1** (300ms): Logic check — determines if clock should hide (mouse hover, taskbar visible, fullscreen app)
-- **Timer 2** (1000ms): Clock update — redraws time text when minute changes
-- **Timer 3** (10ms, dynamic): Animation tick — handles smooth slide up/down
+- **Timer 1** (120/500/1000ms, adaptive — `ArmLogicTimer`): visibility safety net
+  behind the WinEvent hooks. Snappy near the cursor, relaxed otherwise, stopped
+  entirely while manually hidden.
+- **Timer 2** (boundary-armed — `ArmClockTimer`): clock text. Armed for the next
+  second/minute boundary rather than polled, and **killed outright while
+  hidden** — nothing is on screen to keep current, so the redraw happens on the
+  way back in instead (`StartSlide` → `RefreshClockText`).
+- **Timer 3** (10ms, dynamic): animation tick — smooth slide up/down.
+
+While manually hidden all three timers are off: the process sleeps in
+`GetMessage` until a tray click or a WinEvent.
+
+### The one rule for the clock text
+`RecalculateAll` is the only function that draws, so it is the only function
+that writes `g_lastRendered` — the string currently on screen. Do not keep a
+second "last time I saw" copy at a call site; that is what the pre-v1.7 code did
+and the two drifted. `RefreshClockText()` is the only correct way to ask for an
+update: it renders when the string changed **or** when the surface is gone, and
+is a no-op otherwise.
 
 ### Configuration Storage
 All settings stored in Windows Registry at `HKEY_CURRENT_USER\Software\EdgeClock`. Startup auto-run registered at `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`.
@@ -161,3 +177,38 @@ layout with section headers and separator lines, full keyboard navigation
 
 **Other**: log file rotates at 32 KB; `ClampConfig` centralises range checks;
 `WM_APP+1` from a second instance now un-hides the clock.
+
+## v1.7 — stale-time fix + idle footprint (2026-08-03)
+**The bug**: after any hidden period the clock slid back in showing the time
+from when it hid, for up to a full minute. v1.6 moved the text timer to
+boundary-arming, and `StartSlide(STATE_SLIDING_UP)` only *armed* that timer —
+animation frames re-blit the cached surface, so nothing redrew until the next
+boundary. Fixed by rendering on the way in (`RefreshClockText`), not scheduling.
+
+**Leap second could freeze the clock for 24 days**: `ArmClockTimer` computed
+`(60 - st.wSecond) * 1000 - st.wMilliseconds` in `UINT`. Windows reports
+`wSecond == 60` during a leap second when leap-second support is enabled, so the
+expression wrapped to ~4.29e9 ms and `SetTimer` clamped it to
+`USER_TIMER_MAXIMUM` (24.8 days). Now computed signed and clamped to
+[50, 61000] — the largest legitimate value is 60035, so the clamp only ever
+catches a slip.
+
+**Idle footprint**: timer 2 is killed while hidden (was 1 pointless wakeup/min),
+and the surface DIB is freed when the clock parks hidden and rebuilt on the way
+in. The DIB is `w * h * 4` — ~7 KB at the default 24 px, ~400 KB at the 200 px
+maximum, so this scales with font size. The boundary guard also went 20 ms → 35 ms
+(past the ~15.6 ms timer granularity) so an early fire no longer costs a
+re-arm tick.
+
+**Ordering that matters**: the park cleanup (`FreeSurface`) runs *after* the
+final `PresentClock` of the slide-down. Freeing first makes that call a no-op
+(`PresentClock` bails on a null surface) and strands the clock one frame short
+of hidden.
+
+**Also**: `WM_POWERBROADCAST` (`PBT_APMRESUMEAUTOMATIC`/`PBT_APMRESUMESUSPEND`)
+corrects the text on resume instead of waiting for a timer armed against
+pre-sleep ticks — the sibling of the existing `WM_TIMECHANGE` handler.
+
+**Deliberately not done**: unhooking the WinEvent hooks while manually hidden.
+`EvaluateVisibility` early-returns in two compares in that state, so the saving
+is noise, and it adds a way for the clock to never come back.

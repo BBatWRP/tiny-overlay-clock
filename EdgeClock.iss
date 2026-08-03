@@ -4,7 +4,7 @@
 ; so this keeps upgrades replacing existing installs instead of duplicating.
 AppId=EdgeClock
 AppName=EdgeClock
-AppVersion=1.6.0.0
+AppVersion=1.7.0.0
 ; Detect the app's single-instance mutex: installer asks the user to close
 ; a running EdgeClock instead of failing on a locked exe
 AppMutex=EdgeClock_GlobalInstance_Mutex
@@ -14,7 +14,7 @@ RestartApplications=no
 DefaultDirName={autopf}\EdgeClock
 DefaultGroupName=EdgeClock
 OutputDir=Output
-OutputBaseFilename=EdgeClockSetup_v1.6
+OutputBaseFilename=EdgeClockSetup_v1.7
 Compression=lzma2
 SolidCompression=yes
 SetupIconFile=clock_23989.ico
