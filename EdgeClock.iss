@@ -24,7 +24,10 @@ PrivilegesRequired=admin
 ; HKCU Run key is intentional: it targets the installing user, and the app
 ; itself has a "Run on Startup" toggle to fix it for any other user.
 UsedUserAreasWarning=no
-ArchitecturesInstallIn64BitMode=x64
+; "x64" is deprecated (warns in Inno Setup 6.7, rejected in 7). "x64compatible"
+; is the right replacement rather than "x64os": it also covers ARM64 running the
+; x64 build under emulation, which "x64os" would exclude.
+ArchitecturesInstallIn64BitMode=x64compatible
 DisableDirPage=no
 
 [Files]
