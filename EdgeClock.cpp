@@ -152,11 +152,18 @@ bool IsValidTimeFormat(const WCHAR* f) {
 
 // Forces every setting into its valid range. Called after loading from the
 // registry and after importing a settings file.
+// Float checks are written as !(in range) so NaN — which fails every
+// comparison — is caught too (an imported "FontSize=nan" used to slip through).
 void ClampConfig() {
-    if (Config::fontSize < 4.0f) Config::fontSize = 14.0f;
-    if (Config::fontSize > 200.0f) Config::fontSize = 72.0f;
-    if (Config::outlineWidth < 0.0f) Config::outlineWidth = 0.0f;
+    if (!(Config::fontSize >= 4.0f)) Config::fontSize = 14.0f;
+    if (Config::fontSize > 200.0f) Config::fontSize = 200.0f;
+    if (!(Config::outlineWidth >= 0.0f)) Config::outlineWidth = 0.0f;
     if (Config::outlineWidth > 50.0f) Config::outlineWidth = 50.0f;
+    // Offsets beyond any real monitor only push the clock off-screen, and a
+    // huge or NaN value is undefined behaviour once cast to int for placement.
+    if (!(Config::offsetX >= -5000.0f && Config::offsetX <= 5000.0f)) Config::offsetX = 0.0f;
+    if (!(Config::offsetY >= -5000.0f && Config::offsetY <= 5000.0f)) Config::offsetY = 0.0f;
+    if (Config::taskbarThreshold < 0 || Config::taskbarThreshold > 64) Config::taskbarThreshold = 4;
     if (Config::animDuration < 0) Config::animDuration = 500;
     if (Config::animDuration > 5000) Config::animDuration = 5000;
     if (Config::opacity < 20) Config::opacity = 20;
@@ -174,40 +181,51 @@ void ClampConfig() {
     if (!Config::fontName[0]) lstrcpyW(Config::fontName, L"Segoe UI");
 }
 
+// Registry readers: each call gets its own size and an exact type, and the
+// target is only written on success. A missing, mistyped or oversized value
+// leaves the default in place instead of overrunning the neighbouring global.
+static void RegReadDword(HKEY k, LPCTSTR name, void* out) {
+    DWORD v, sz = sizeof(v);
+    if (RegGetValue(k, NULL, name, RRF_RT_REG_DWORD, NULL, &v, &sz) == ERROR_SUCCESS)
+        memcpy(out, &v, sizeof(v));
+}
+
+static void RegReadFloat(HKEY k, LPCTSTR name, float* out) {
+    float v; DWORD sz = sizeof(v);
+    if (RegGetValue(k, NULL, name, RRF_RT_REG_BINARY, NULL, &v, &sz) == ERROR_SUCCESS &&
+        sz == sizeof(v))
+        *out = v;
+}
+
+static void RegReadStr32(HKEY k, LPCTSTR name, WCHAR* out) {
+    WCHAR v[32]; DWORD sz = sizeof(v);
+    if (RegGetValue(k, NULL, name, RRF_RT_REG_SZ, NULL, v, &sz) == ERROR_SUCCESS)
+        lstrcpynW(out, v, 32);
+}
+
 void LoadConfig() {
     Log("Loading Config...");
     HKEY hKey;
     if (RegOpenKeyEx(HKEY_CURRENT_USER, _T("Software\\EdgeClock"), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        DWORD sizeFloat = sizeof(float);
-        DWORD sizeInt = sizeof(int);
-        
-        // Try reading floats as binary first (backward compatibility might fail effectively but resets to default)
-        RegQueryValueEx(hKey, _T("FontSize"), NULL, NULL, (LPBYTE)&Config::fontSize, &sizeFloat);
-        RegQueryValueEx(hKey, _T("OutlineWidth"), NULL, NULL, (LPBYTE)&Config::outlineWidth, &sizeFloat);
-        
-        RegQueryValueEx(hKey, _T("AnimDuration"), NULL, NULL, (LPBYTE)&Config::animDuration, &sizeInt);
-        RegQueryValueEx(hKey, _T("TaskbarThreshold"), NULL, NULL, (LPBYTE)&Config::taskbarThreshold, &sizeInt);
-        RegQueryValueEx(hKey, _T("OffsetX"), NULL, NULL, (LPBYTE)&Config::offsetX, &sizeFloat);
-        RegQueryValueEx(hKey, _T("OffsetY"), NULL, NULL, (LPBYTE)&Config::offsetY, &sizeFloat);
-        RegQueryValueEx(hKey, _T("TextColor"), NULL, NULL, (LPBYTE)&Config::textColor, &sizeInt);
-        RegQueryValueEx(hKey, _T("OutlineColor"), NULL, NULL, (LPBYTE)&Config::outlineColor, &sizeInt);
-        
-        DWORD currentSize = sizeof(Config::fontName);
-        if (RegQueryValueEx(hKey, _T("FontName"), NULL, NULL, (LPBYTE)Config::fontName, &currentSize) == ERROR_SUCCESS) {
-             Config::fontName[31] = L'\0'; // Safety null-terminate
-        }
+        RegReadFloat(hKey, _T("FontSize"), &Config::fontSize);
+        RegReadFloat(hKey, _T("OutlineWidth"), &Config::outlineWidth);
+        RegReadFloat(hKey, _T("OffsetX"), &Config::offsetX);
+        RegReadFloat(hKey, _T("OffsetY"), &Config::offsetY);
 
-        DWORD fmtSize = sizeof(Config::timeFormat);
-        if (RegQueryValueEx(hKey, _T("TimeFormat"), NULL, NULL, (LPBYTE)Config::timeFormat, &fmtSize) == ERROR_SUCCESS) {
-             Config::timeFormat[31] = L'\0';
-        }
-        RegQueryValueEx(hKey, _T("Opacity"), NULL, NULL, (LPBYTE)&Config::opacity, &sizeInt);
-        RegQueryValueEx(hKey, _T("EffectMode"), NULL, NULL, (LPBYTE)&Config::effectMode, &sizeInt);
-        RegQueryValueEx(hKey, _T("FontWeight"), NULL, NULL, (LPBYTE)&Config::fontWeight, &sizeInt);
-        RegQueryValueEx(hKey, _T("FxIntensity"), NULL, NULL, (LPBYTE)&Config::fxIntensity, &sizeInt);
-        RegQueryValueEx(hKey, _T("Corner"), NULL, NULL, (LPBYTE)&Config::corner, &sizeInt);
-        RegQueryValueEx(hKey, _T("MonitorIndex"), NULL, NULL, (LPBYTE)&Config::monitorIndex, &sizeInt);
-        RegQueryValueEx(hKey, _T("Language"), NULL, NULL, (LPBYTE)&Config::language, &sizeInt);
+        RegReadDword(hKey, _T("AnimDuration"), &Config::animDuration);
+        RegReadDword(hKey, _T("TaskbarThreshold"), &Config::taskbarThreshold);
+        RegReadDword(hKey, _T("TextColor"), &Config::textColor);
+        RegReadDword(hKey, _T("OutlineColor"), &Config::outlineColor);
+        RegReadDword(hKey, _T("Opacity"), &Config::opacity);
+        RegReadDword(hKey, _T("EffectMode"), &Config::effectMode);
+        RegReadDword(hKey, _T("FontWeight"), &Config::fontWeight);
+        RegReadDword(hKey, _T("FxIntensity"), &Config::fxIntensity);
+        RegReadDword(hKey, _T("Corner"), &Config::corner);
+        RegReadDword(hKey, _T("MonitorIndex"), &Config::monitorIndex);
+        RegReadDword(hKey, _T("Language"), &Config::language);
+
+        RegReadStr32(hKey, _T("FontName"), Config::fontName);
+        RegReadStr32(hKey, _T("TimeFormat"), Config::timeFormat);
 
         RegCloseKey(hKey);
     }
@@ -714,6 +732,20 @@ void RenderClock(GraphicsPath& path, const RectF& b) {
 
 void ArmClockTimer(HWND hwnd); // fwd decl
 
+// True when the format changes every second: %S, and %X / %c, which include
+// seconds in msvcrt's output. The '#' flag (%#S) is skipped like in
+// IsValidTimeFormat. A plain substring search for "%S" missed all three.
+bool FormatHasSeconds() {
+    for (const WCHAR* p = Config::timeFormat; *p; ++p) {
+        if (*p != L'%') continue;
+        ++p;
+        if (*p == L'#') ++p;
+        if (*p == L'S' || *p == L'X' || *p == L'c') return true;
+        if (!*p) break;
+    }
+    return false;
+}
+
 // The time string currently painted into the cached surface — i.e. what the
 // user is actually looking at. Owned by RecalculateAll(), the only function
 // that draws, so it can never drift from the pixels the way a caller-side
@@ -775,9 +807,12 @@ void RecalculateAll(HWND hwnd) {
     // The render just touched GDI+'s heaps and the glyph rasteriser; hand those
     // pages straight back. They are only needed again on the next redraw, at
     // most once a minute, so this keeps the resident set well under 1 MB.
-    // Skipped during live preview: the Settings dialog re-renders on every
-    // keystroke, and emptying the working set each time only churns faults.
-    if (!g_settingsOpen)
+    // Skipped during live preview (re-renders on every keystroke) and for
+    // seconds formats (re-renders every second): emptying the working set that
+    // often only churns page faults. Those still trim when the clock parks.
+    // ponytail: seconds formats never trim while visible; throttle to once a
+    // minute if their resident set ever matters.
+    if (!g_settingsOpen && !FormatHasSeconds())
         SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 
     ArmClockTimer(hwnd);
@@ -968,7 +1003,8 @@ bool ImportSettings(HWND owner) {
     if (*p == 0xFEFF) ++p; // Skip BOM
     if (!wcsstr(p, kSettingsHeader)) { free(text); return false; }
 
-    // Parse into a scratch copy so a malformed file can't half-apply
+    // Values go straight into Config; unknown keys are ignored and
+    // ClampConfig() below repairs anything out of range or malformed.
     for (WCHAR* line = p; line && *line; ) {
         WCHAR* eol = wcspbrk(line, L"\r\n");
         if (eol) *eol = L'\0';
@@ -1073,17 +1109,12 @@ void RecalculateAll(HWND hwnd); // fwd decl
 void ApplyPreview(HWND hwnd) {
     TCHAR buf[64];
 
+    // Ranges are enforced once, by ClampConfig() at the end of this function.
     GetDlgItemText(hwnd, ID_EDIT_FONT_SIZE, buf, 64);
-    float v = (float)_wtof(buf);
-    if (v < 4.0f) v = 14.0f;
-    if (v > 200.0f) v = 72.0f;
-    Config::fontSize = v;
+    Config::fontSize = (float)_wtof(buf);
 
     GetDlgItemText(hwnd, ID_EDIT_OUTLINE_WIDTH, buf, 64);
-    v = (float)_wtof(buf);
-    if (v < 0.0f) v = 0.0f;
-    if (v > 50.0f) v = 50.0f;
-    Config::outlineWidth = v;
+    Config::outlineWidth = (float)_wtof(buf);
 
     GetDlgItemText(hwnd, ID_EDIT_OFFSET_X, buf, 64);
     Config::offsetX = (float)_wtof(buf);
@@ -1119,6 +1150,7 @@ void ApplyPreview(HWND hwnd) {
     Config::textColor = tempTextColor;
     Config::outlineColor = tempOutlineColor;
     lstrcpyW(Config::fontName, tempFontName);
+    ClampConfig();
 
     HWND hParent = GetParent(hwnd);
     if (hParent) {
@@ -1894,8 +1926,6 @@ void AssertTopmost(HWND hwnd) {
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
-inline bool FormatHasSeconds() { return wcsstr(Config::timeFormat, L"%S") != NULL; }
-
 // Schedules the clock-text timer to fire just after the next boundary it can
 // possibly change on: the next second when the format shows seconds, the next
 // minute otherwise. Compared to polling every second this drops the idle wakeup
@@ -2189,6 +2219,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return TRUE;
 
     case WM_TRAYICON:
+        // Settings is modal over live config. Letting the tray menu run under
+        // it would SaveConfig() half-edited preview values that Cancel then
+        // only reverts in memory — so any tray click just surfaces the dialog.
+        if (g_settingsOpen) {
+            if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
+                HWND hDlg = FindWindow(_T("EdgeClockSettings"), NULL);
+                if (hDlg) SetForegroundWindow(hDlg);
+            }
+            return 0;
+        }
         if (lParam == WM_RBUTTONUP) {
             ShowContextMenu(hwnd);
         } else if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
@@ -2353,7 +2393,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_ENDSESSION:
         // Graceful cleanup when Windows shuts down or user logs off
         if (wParam) {
-            SaveConfig();
+            // With Settings open, Config holds uncommitted preview values;
+            // the registry already has the last saved state.
+            if (!g_settingsOpen) SaveConfig();
             RemoveTrayIcon();
         }
         return 0;

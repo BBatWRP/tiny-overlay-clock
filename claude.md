@@ -67,6 +67,8 @@ Exe size across the three steps: **688 KB → 270 KB → 166 KB** (−76%).
 `SetProcessWorkingSetSize(-1, -1)` runs immediately after every render (inside
 `RecalculateAll`) and when the clock goes hidden. Because a render happens at
 most once a minute, the pages it returns are only faulted back once a minute.
+Exception: formats that show seconds (`FormatHasSeconds`: `%S`, `%X`, `%c`)
+render every second, so they skip the per-render trim and only trim on park.
 
 **Rejected after measurement:** shutting GDI+ down between renders
 (`GdiplusShutdown` + restart per minute). It saved only ~90 KB — the trim already
