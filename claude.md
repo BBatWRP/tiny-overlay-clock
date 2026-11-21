@@ -4,21 +4,25 @@
 EdgeClock is a lightweight, single-file Win32 desktop clock application written in C++. It displays the current time (HH:MM) in the bottom-right corner of the screen with a transparent, outlined text overlay. The clock auto-hides when fullscreen apps are detected or the taskbar is raised, using smooth slide animations.
 
 ## Architecture
-This is a **single-file Win32 application** (`EdgeClock.cpp`, ~1090 lines). All logic resides in one `.cpp` file with no external dependencies beyond the Windows SDK and GDI+.
+This is a **single-file Win32 application** (`EdgeClock.cpp`, ~2,500 lines). All logic resides in one `.cpp` file with no external dependencies beyond the Windows SDK and GDI+.
 
 ### Key Components
-| Component | Lines | Purpose |
-|---|---|---|
-| `Config` namespace | 40–67 | Default settings (font, colors, animation, offsets) |
-| `SaveConfig` / `LoadConfig` | 71–118 | Persist settings to `HKCU\Software\EdgeClock` registry |
-| `IsStartupEnabled` / `SetStartup` | 326–352 | Manage "Run on Startup" via `HKCU\...\Run` registry key |
-| `UpdateLayeredWindowContent` | 175–244 | GDI+ rendering of the clock text onto a layered window |
-| `CalculateTextSize` | 249–287 | Measures text bounding box to size the window exactly |
-| `ShowContextMenu` | 354–376 | System tray right-click menu |
-| `SettingsWndProc` | 434–749 | Dark-themed settings dialog (colors, font, offsets, animation) |
-| `WindowProc` | 782–973 | Main window procedure: timers, animation, auto-hide logic |
-| `EnableEfficiencyMode` | 977–1018 | Enables EcoQoS / IDLE priority for power efficiency |
-| `WinMain` | 1020–1089 | Entry point: single-instance mutex, init, message loop |
+Line numbers drift with every change — search for the name instead.
+
+| Component | Purpose |
+|---|---|
+| `Defaults` / `Config` namespaces | Factory defaults (the only copy) and live settings |
+| `ClampConfig` | Repairs out-of-range / NaN values; used by load, import and the Settings dialog |
+| `SaveConfig` / `LoadConfig` | Persist settings to `HKCU\Software\EdgeClock` (typed `RegGetValue` reads) |
+| `IsStartupEnabled` / `SetStartup` | Manage "Run on Startup" via `HKCU\...\Run` registry key |
+| `BuildClockPath` / `RenderClock` / `PresentClock` | Glyph path once per update → cached DIB → `UpdateLayeredWindow` |
+| `RecalculateAll` / `RefreshClockText` | The only draw path, and the only correct way to request one |
+| `ShowContextMenu` | System tray right-click menu |
+| `SettingsWndProc` / `DoSettingsDialog` | Dark-themed modal settings dialog with live preview |
+| `EvaluateVisibility` | Auto-hide logic (hover, taskbar, fullscreen) |
+| `WindowProc` | Main window procedure: timers, animation |
+| `EnableEfficiencyMode` | Enables EcoQoS / IDLE priority for power efficiency |
+| `WinMain` | Entry point: single-instance mutex, init, message loop |
 
 ### Timer System
 - **Timer 1** (120/500/1000ms, adaptive — `ArmLogicTimer`): visibility safety net
@@ -28,7 +32,7 @@ This is a **single-file Win32 application** (`EdgeClock.cpp`, ~1090 lines). All 
   second/minute boundary rather than polled, and **killed outright while
   hidden** — nothing is on screen to keep current, so the redraw happens on the
   way back in instead (`StartSlide` → `RefreshClockText`).
-- **Timer 3** (10ms, dynamic): animation tick — smooth slide up/down.
+- **Timer 3** (16ms, `Config::refreshRate`): animation tick — smooth slide up/down.
 
 While manually hidden all three timers are off: the process sleeps in
 `GetMessage` until a tray click or a WinEvent.
@@ -120,7 +124,7 @@ would slot into `check.bat` as a fourth stage.
 - Localization covers English and Thai only
 
 ## Recent Fixes
-- Log path now resolves next to exe (was relative to CWD)
+- Log path is `%LOCALAPPDATA%\EdgeClock\EdgeClock_Log.txt`, timestamped (next to the exe failed silently under Program Files)
 - Startup registry path is now quoted for paths with spaces
 - `IsStartupEnabled` checks the stored path contains `edgeclock.exe` (substring check, not a full path match against the current exe)
 - Settings dialog GDI resources properly nulled after deletion (was use-after-free)

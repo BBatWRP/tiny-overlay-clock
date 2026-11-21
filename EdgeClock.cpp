@@ -32,9 +32,11 @@ using namespace Gdiplus;
 // =============================================================
 static HANDLE g_hMutex = NULL; // Global mutex for single-instance
 
-// Appends a line to EdgeClock_Log.txt next to the exe. The file is rotated
-// (truncated) once per process when it exceeds kLogMaxBytes so it can never
-// grow without bound across launches.
+// Appends a timestamped line to %LOCALAPPDATA%\EdgeClock\EdgeClock_Log.txt.
+// Not next to the exe: an installed copy lives in Program Files, which a
+// normal user cannot write, so logging there silently did nothing. The file is
+// rotated (truncated) once per process when it exceeds kLogMaxBytes so it can
+// never grow without bound across launches.
 void Log(const char* msg) {
     static const DWORD kLogMaxBytes = 32768;
     static char logPath[MAX_PATH] = {0};
@@ -42,11 +44,18 @@ void Log(const char* msg) {
     const char* mode = "a";
 
     if (!logPath[0]) {
-        // Resolve log path next to the exe, not relative to CWD
-        GetModuleFileNameA(NULL, logPath, MAX_PATH);
-        char* lastSlash = strrchr(logPath, '\\');
-        if (lastSlash) strcpy(lastSlash + 1, "EdgeClock_Log.txt");
-        else strcpy(logPath, "EdgeClock_Log.txt");
+        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, logPath)) &&
+            strlen(logPath) + 32 < MAX_PATH) {
+            strcat(logPath, "\\EdgeClock");
+            CreateDirectoryA(logPath, NULL); // Fine if it already exists
+            strcat(logPath, "\\EdgeClock_Log.txt");
+        } else {
+            // Fallback: next to the exe (works for a portable copy)
+            GetModuleFileNameA(NULL, logPath, MAX_PATH);
+            char* lastSlash = strrchr(logPath, '\\');
+            if (lastSlash) strcpy(lastSlash + 1, "EdgeClock_Log.txt");
+            else strcpy(logPath, "EdgeClock_Log.txt");
+        }
     }
 
     if (!rotateChecked) {
@@ -60,40 +69,57 @@ void Log(const char* msg) {
 
     FILE* f = fopen(logPath, mode);
     if (f) {
-        fprintf(f, "%s\n", msg);
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(f, "%04u-%02u-%02u %02u:%02u:%02u  %s\n", st.wYear, st.wMonth, st.wDay,
+                st.wHour, st.wMinute, st.wSecond, msg);
         fclose(f);
     }
 }
 
+// Factory defaults — the one place they are written. Used to initialise
+// Config, by ClampConfig() to repair bad values, and by the Settings dialog's
+// "Defaults" button.
+namespace Defaults {
+    const float    fontSize = 14.0f;
+    const WCHAR    fontName[] = L"Segoe UI";
+    const float    outlineWidth = 2.0f;
+    const COLORREF textColor = RGB(255, 255, 255);
+    const COLORREF outlineColor = RGB(0, 0, 0);
+    const int      animDuration = 500;
+    const int      taskbarThreshold = 4;
+    const WCHAR    timeFormat[] = L"%H:%M";
+    const int      opacity = 100;
+    const int      fontWeight = 1;
+    const int      fxIntensity = 100;
+}
+
 namespace Config {
     // --- Appearance Settings ---
-    // These control the visual look of the clock.
-    float fontSize = 14.0f;                  
-    WCHAR fontName[32] = L"Segoe UI"; // Default font
-    float outlineWidth = 2.0f;         
-    COLORREF textColor = RGB(255, 255, 255);
-    COLORREF outlineColor = RGB(0, 0, 0);
-    
+    float fontSize = Defaults::fontSize;
+    WCHAR fontName[32] = L"Segoe UI";  // = Defaults::fontName (arrays can't copy-init)
+    float outlineWidth = Defaults::outlineWidth;
+    COLORREF textColor = Defaults::textColor;
+    COLORREF outlineColor = Defaults::outlineColor;
+
     // --- Animation & Performance ---
-    // animDuration: How long the slide animation takes in milliseconds.
-    int animDuration = 500;       
+    int animDuration = Defaults::animDuration; // Slide duration in ms
     int refreshRate = 16;         // Animation tick interval in ms (~60fps)
-    
+
     // --- Tray Icon ---
     const TCHAR trayTooltip[] = _T("Edge Clock");
-    
+
     // --- Auto-Hide Logic ---
-    // Thresholds for determining when to hide the clock.
-    int taskbarThreshold = 4;
+    int taskbarThreshold = Defaults::taskbarThreshold;
     float offsetX = 0.0f;
     float offsetY = 0.0f;
 
     // --- Clock Text ---
-    WCHAR timeFormat[32] = L"%H:%M"; // strftime format (e.g. %H:%M:%S, %I:%M %p, %a %d %H:%M)
-    int opacity = 100;               // Clock opacity in percent (20-100)
-    int effectMode = 0;              // 0 = Outline, 1 = Soft Shadow, 2 = Glow, 3 = Pill
-    int fontWeight = 1;              // 0 = Regular, 1 = Bold, 2 = Italic, 3 = Bold Italic
-    int fxIntensity = 100;           // Effect strength in percent (10-200; 100 = stock look)
+    WCHAR timeFormat[32] = L"%H:%M"; // = Defaults::timeFormat; strftime format
+    int opacity = Defaults::opacity;         // Clock opacity in percent (20-100)
+    int effectMode = 0;                      // 0 = Outline, 1 = Soft Shadow, 2 = Glow, 3 = Pill
+    int fontWeight = Defaults::fontWeight;   // 0 = Regular, 1 = Bold, 2 = Italic, 3 = Bold Italic
+    int fxIntensity = Defaults::fxIntensity; // Effect strength in percent (10-200)
 
     // --- Placement ---
     int corner = 0;                  // 0 = BR, 1 = BL, 2 = TR, 3 = TL
@@ -103,7 +129,8 @@ namespace Config {
     int language = 0;                // 0 = Auto (from OS), 1 = English, 2 = Thai
 
     // --- Menu Presets ---
-    const float sizeSmall = 16.0f;
+    // Small is the default size, so a fresh install shows a ticked preset.
+    const float sizeSmall = Defaults::fontSize;
     const float sizeMedium = 24.0f;
     const float sizeLarge = 32.0f;              
 }
@@ -155,7 +182,10 @@ bool IsValidTimeFormat(const WCHAR* f) {
 // Float checks are written as !(in range) so NaN — which fails every
 // comparison — is caught too (an imported "FontSize=nan" used to slip through).
 void ClampConfig() {
-    if (!(Config::fontSize >= 4.0f)) Config::fontSize = 14.0f;
+    // Out-of-range clamps to the nearest bound (so typing "1" on the way to
+    // "12" previews at 4, not a jump to the default); only NaN resets.
+    if (Config::fontSize != Config::fontSize) Config::fontSize = Defaults::fontSize;
+    if (Config::fontSize < 4.0f) Config::fontSize = 4.0f;
     if (Config::fontSize > 200.0f) Config::fontSize = 200.0f;
     if (!(Config::outlineWidth >= 0.0f)) Config::outlineWidth = 0.0f;
     if (Config::outlineWidth > 50.0f) Config::outlineWidth = 50.0f;
@@ -163,13 +193,13 @@ void ClampConfig() {
     // huge or NaN value is undefined behaviour once cast to int for placement.
     if (!(Config::offsetX >= -5000.0f && Config::offsetX <= 5000.0f)) Config::offsetX = 0.0f;
     if (!(Config::offsetY >= -5000.0f && Config::offsetY <= 5000.0f)) Config::offsetY = 0.0f;
-    if (Config::taskbarThreshold < 0 || Config::taskbarThreshold > 64) Config::taskbarThreshold = 4;
-    if (Config::animDuration < 0) Config::animDuration = 500;
+    if (Config::taskbarThreshold < 0 || Config::taskbarThreshold > 64) Config::taskbarThreshold = Defaults::taskbarThreshold;
+    if (Config::animDuration < 0) Config::animDuration = Defaults::animDuration;
     if (Config::animDuration > 5000) Config::animDuration = 5000;
     if (Config::opacity < 20) Config::opacity = 20;
     if (Config::opacity > 100) Config::opacity = 100;
     if (Config::effectMode < 0 || Config::effectMode > 3) Config::effectMode = 0;
-    if (Config::fontWeight < 0 || Config::fontWeight > 3) Config::fontWeight = 1;
+    if (Config::fontWeight < 0 || Config::fontWeight > 3) Config::fontWeight = Defaults::fontWeight;
     if (Config::fxIntensity < 10) Config::fxIntensity = 10;
     if (Config::fxIntensity > 200) Config::fxIntensity = 200;
     if (Config::corner < 0 || Config::corner > 3) Config::corner = 0;
@@ -177,8 +207,8 @@ void ClampConfig() {
     if (Config::language < 0 || Config::language > 2) Config::language = 0;
     Config::fontName[31] = L'\0';
     Config::timeFormat[31] = L'\0';
-    if (!IsValidTimeFormat(Config::timeFormat)) lstrcpyW(Config::timeFormat, L"%H:%M");
-    if (!Config::fontName[0]) lstrcpyW(Config::fontName, L"Segoe UI");
+    if (!IsValidTimeFormat(Config::timeFormat)) lstrcpyW(Config::timeFormat, Defaults::timeFormat);
+    if (!Config::fontName[0]) lstrcpyW(Config::fontName, Defaults::fontName);
 }
 
 // Registry readers: each call gets its own size and an exact type, and the
@@ -317,7 +347,6 @@ inline const WCHAR* L(int id) { return g_str[id]; }
 #define ID_SIZE_SMALL 2002
 #define ID_SIZE_MEDIUM 2003
 #define ID_SIZE_LARGE 2004
-#define ID_SIZE_CUSTOM 2005 
 #define ID_MENU_TOGGLE_HIDE 2006 
 #define ID_MENU_STARTUP 2007 
 #define ID_MENU_SETTINGS 2008
@@ -1291,20 +1320,16 @@ void DrawDarkButton(LPDRAWITEMSTRUCT pDIS, LPCTSTR text) {
 }
 
 // --- Time format presets shown in the Settings combo ---
-struct FormatPreset { const WCHAR* label; const WCHAR* fmt; };
-const FormatPreset kFormatPresets[] = {
-    { L"24-hour  (14:35)",   L"%H:%M" },
-    { L"24-hour + seconds",  L"%H:%M:%S" },
-    { L"12-hour  (2:35 PM)", L"%I:%M %p" },
-    { L"12-hour + seconds",  L"%I:%M:%S %p" },
-    { L"Date + time (Sat 12)", L"%a %d %H:%M" },
+// Labels come from the string table (S_FMT_24 + i), in this same order.
+const WCHAR* const kFormatPresets[] = {
+    L"%H:%M", L"%H:%M:%S", L"%I:%M %p", L"%I:%M:%S %p", L"%a %d %H:%M",
 };
 const int kNumFormatPresets = (int)(sizeof(kFormatPresets) / sizeof(kFormatPresets[0]));
 
 // Returns the preset index matching fmt, or kNumFormatPresets ("Custom")
 int MatchFormatPreset(const WCHAR* fmt) {
     for (int i = 0; i < kNumFormatPresets; ++i)
-        if (wcscmp(fmt, kFormatPresets[i].fmt) == 0) return i;
+        if (wcscmp(fmt, kFormatPresets[i]) == 0) return i;
     return kNumFormatPresets;
 }
 
@@ -1587,7 +1612,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             // Custom-draw the trackbars so they match the dark theme:
             // flat grey channel + accent-blue thumb, no tick marks.
             LPNMHDR hdr = (LPNMHDR)lParam;
-            if ((hdr->idFrom == ID_TRACK_ANIM_SPEED || hdr->idFrom == ID_TRACK_OPACITY) && hdr->code == NM_CUSTOMDRAW) {
+            if ((hdr->idFrom == ID_TRACK_ANIM_SPEED || hdr->idFrom == ID_TRACK_OPACITY ||
+                 hdr->idFrom == ID_TRACK_FXPOWER) && hdr->code == NM_CUSTOMDRAW) {
                 LPNMCUSTOMDRAW cd = (LPNMCUSTOMDRAW)lParam;
                 if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
                 if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
@@ -1704,7 +1730,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                 if (sel >= 0 && sel < kNumFormatPresets) {
                     SendMessage(hEdit, EM_SETREADONLY, TRUE, 0);
                     // SetWindowText fires EN_CHANGE -> ApplyPreview
-                    SetWindowText(hEdit, kFormatPresets[sel].fmt);
+                    SetWindowText(hEdit, kFormatPresets[sel]);
                 } else { // Custom…
                     SendMessage(hEdit, EM_SETREADONLY, FALSE, 0);
                     SetFocus(hEdit);
@@ -1788,46 +1814,41 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                     // Reset temp state + UI controls to defaults. The
                     // EN_CHANGE/ApplyPreview flow previews it live; Cancel
                     // still restores the pre-dialog snapshot.
-                    tempTextColor = RGB(255, 255, 255);
-                    tempOutlineColor = RGB(0, 0, 0);
-                    lstrcpyW(tempFontName, L"Segoe UI");
-                    const float defFontSize = 14.0f;
-                    const float defOutlineWidth = 2.0f;
-                    const int defAnimDuration = 500;
-                    const float defOffsetX = 0.0f;
-                    const float defOffsetY = 0.0f;
+                    tempTextColor = Defaults::textColor;
+                    tempOutlineColor = Defaults::outlineColor;
+                    lstrcpyW(tempFontName, Defaults::fontName);
 
                     TCHAR buf[32];
-                    _stprintf(buf, _T("%.1f"), defFontSize);
+                    _stprintf(buf, _T("%.1f"), Defaults::fontSize);
                     SetWindowText(GetDlgItem(hwnd, ID_EDIT_FONT_SIZE), buf);
 
-                    _stprintf(buf, _T("%.1f"), defOutlineWidth);
+                    _stprintf(buf, _T("%.1f"), Defaults::outlineWidth);
                     SetWindowText(GetDlgItem(hwnd, ID_EDIT_OUTLINE_WIDTH), buf);
 
-                    SendMessage(GetDlgItem(hwnd, ID_TRACK_ANIM_SPEED), TBM_SETPOS, TRUE, defAnimDuration / 100);
-                    _stprintf(buf, _T("%.1fs"), defAnimDuration / 1000.0);
+                    SendMessage(GetDlgItem(hwnd, ID_TRACK_ANIM_SPEED), TBM_SETPOS, TRUE, Defaults::animDuration / 100);
+                    _stprintf(buf, _T("%.1fs"), Defaults::animDuration / 1000.0);
                     SetWindowText(GetDlgItem(hwnd, ID_STATIC_DURATION_VAL), buf);
 
-                    _stprintf(buf, _T("%.1f"), defOffsetX);
-                    SetWindowText(GetDlgItem(hwnd, ID_EDIT_OFFSET_X), buf);
+                    SetWindowText(GetDlgItem(hwnd, ID_EDIT_OFFSET_X), _T("0.0"));
+                    SetWindowText(GetDlgItem(hwnd, ID_EDIT_OFFSET_Y), _T("0.0"));
 
-                    _stprintf(buf, _T("%.1f"), defOffsetY);
-                    SetWindowText(GetDlgItem(hwnd, ID_EDIT_OFFSET_Y), buf);
-
-                    SendMessage(GetDlgItem(hwnd, ID_COMBO_FORMAT), CB_SETCURSEL, 0, 0);
+                    SendMessage(GetDlgItem(hwnd, ID_COMBO_FORMAT), CB_SETCURSEL,
+                                MatchFormatPreset(Defaults::timeFormat), 0);
                     SendMessage(GetDlgItem(hwnd, ID_EDIT_TIME_FORMAT), EM_SETREADONLY, TRUE, 0);
-                    SetWindowText(GetDlgItem(hwnd, ID_EDIT_TIME_FORMAT), L"%H:%M");
+                    SetWindowText(GetDlgItem(hwnd, ID_EDIT_TIME_FORMAT), Defaults::timeFormat);
 
                     SendMessage(GetDlgItem(hwnd, ID_COMBO_EFFECT), CB_SETCURSEL, 0, 0);
-                    SendMessage(GetDlgItem(hwnd, ID_COMBO_WEIGHT), CB_SETCURSEL, 1, 0); // Bold
+                    SendMessage(GetDlgItem(hwnd, ID_COMBO_WEIGHT), CB_SETCURSEL, Defaults::fontWeight, 0);
                     SendMessage(GetDlgItem(hwnd, ID_COMBO_CORNER), CB_SETCURSEL, 0, 0); // Bottom-right
                     SendMessage(GetDlgItem(hwnd, ID_COMBO_MONITOR), CB_SETCURSEL, 0, 0); // Auto
 
-                    SendMessage(GetDlgItem(hwnd, ID_TRACK_FXPOWER), TBM_SETPOS, TRUE, 100);
-                    SetWindowText(GetDlgItem(hwnd, ID_STATIC_FXPOWER_VAL), _T("100%"));
+                    SendMessage(GetDlgItem(hwnd, ID_TRACK_FXPOWER), TBM_SETPOS, TRUE, Defaults::fxIntensity);
+                    _stprintf(buf, _T("%d%%"), Defaults::fxIntensity);
+                    SetWindowText(GetDlgItem(hwnd, ID_STATIC_FXPOWER_VAL), buf);
 
-                    SendMessage(GetDlgItem(hwnd, ID_TRACK_OPACITY), TBM_SETPOS, TRUE, 100);
-                    SetWindowText(GetDlgItem(hwnd, ID_STATIC_OPACITY_VAL), _T("100%"));
+                    SendMessage(GetDlgItem(hwnd, ID_TRACK_OPACITY), TBM_SETPOS, TRUE, Defaults::opacity);
+                    _stprintf(buf, _T("%d%%"), Defaults::opacity);
+                    SetWindowText(GetDlgItem(hwnd, ID_STATIC_OPACITY_VAL), buf);
 
                     SetWindowText(GetDlgItem(hwnd, ID_STATIC_FONT_NAME), tempFontName);
 
@@ -2257,7 +2278,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 SaveConfig();
                 RecalculateAll(hwnd);
                 break;
-            // Case ID_SIZE_CUSTOM removed
             case ID_MENU_SETTINGS:
                 DoSettingsDialog(hwnd);
                 break;
