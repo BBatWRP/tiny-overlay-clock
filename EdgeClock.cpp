@@ -1181,6 +1181,28 @@ bool g_settingsOpen = false;  // Re-entry guard (tray clicks reach the disabled 
 bool g_fmtInvalid = false;    // Custom format box holds an unusable format (painted red)
 bool g_uiBusy = false;        // A tray-launched modal (file dialog, message box) is up
 
+// Exit request: the tray's Exit item, or the installer/uninstaller posting
+// ID_MENU_EXIT to close a running clock. Destroying the main window while a
+// modal loop is running (Settings, a font/colour/file picker, a message box)
+// would unwind that loop into a dead window after GDI+ has been shut down. So
+// close the innermost modal first (WM_CLOSE = Cancel, which also makes
+// Settings revert its live preview) and retry on timer 4 until none is left.
+void RequestQuit(HWND hwnd) {
+    EndMenu(); // The tray menu may be tracking
+    if (g_settingsOpen || g_uiBusy) {
+        HWND owner = hwnd;
+        if (g_settingsOpen) {
+            HWND hDlg = FindWindow(_T("EdgeClockSettings"), NULL);
+            if (hDlg) owner = hDlg;
+        }
+        HWND top = GetLastActivePopup(owner);
+        if (top && top != hwnd) PostMessage(top, WM_CLOSE, 0, 0);
+        SetTimer(hwnd, 4, 100, NULL);
+        return;
+    }
+    DestroyWindow(hwnd);
+}
+
 void RecalculateAll(HWND hwnd); // fwd decl
 
 // Reads all dialog controls + temp colors/font into Config (with clamping)
@@ -2520,7 +2542,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         int wmId = LOWORD(wParam);
         switch (wmId) {
             case ID_MENU_EXIT:
-                DestroyWindow(hwnd);
+                RequestQuit(hwnd);
                 break;
             case ID_SIZE_SMALL:
                 Config::fontSize = Config::sizeSmall;
@@ -2591,6 +2613,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     // --- Animation Logic ---
     // Handles the sliding up/down animation of the clock with floating point precision.
     case WM_TIMER: {
+        if (wParam == 4) { // Pending exit: retry once the modal has closed
+            KillTimer(hwnd, 4);
+            RequestQuit(hwnd);
+            return 0;
+        }
         if (wParam == 3) { // Animation Timer
             bool animating = false;
             bool parked = false; // Slide-down just finished; release after presenting

@@ -85,7 +85,7 @@ graph TD
 **Option 1: Windows Installer (Recommended)**
 1. Navigate to the [Releases](https://github.com/BBatWRP/tiny-overlay-clock/releases) page.
 2. Download `EdgeClockSetup_v1.7.2.exe` (or the newest `EdgeClockSetup_v*.exe`).
-3. Follow the installation wizard. Upgrading? Exit EdgeClock from the tray first; the installer updates your existing install in place and keeps your settings.
+3. Follow the installation wizard. Upgrading? Just run it: the installer closes a running EdgeClock, updates it in place, starts it again, and keeps your settings.
 
 **Option 2: Portable Executable**
 1. Download `EdgeClock.exe` from [Releases](https://github.com/BBatWRP/tiny-overlay-clock/releases).

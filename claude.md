@@ -33,6 +33,8 @@ Line numbers drift with every change — search for the name instead.
   hidden** — nothing is on screen to keep current, so the redraw happens on the
   way back in instead (`StartSlide` → `RefreshClockText`).
 - **Timer 3** (16ms, `Config::refreshRate`): animation tick — smooth slide up/down.
+- **Timer 4** (100ms, only during exit): `RequestQuit` retry while a modal is
+  being closed. Never armed otherwise.
 
 While manually hidden all three timers are off: the process sleeps in
 `GetMessage` until a tray click or a WinEvent.
@@ -285,3 +287,38 @@ created it.
 - The Settings dialog may open without focus when another app holds the
   foreground lock (posted command, not a click): Windows refuses
   `SetForegroundWindow`. Harmless; a tray click is user input and is allowed.
+
+## v1.7.3 — upgrade without closing the clock (2026-11-23)
+**The flaw**: `AppMutex` made Setup stop with "EdgeClock is currently
+running… close it, then OK" before the wizard opened, and a silent install
+simply aborted (`CloseApplications` never got a chance: the mutex check comes
+first).
+
+**Installer** (`[Code]` in `EdgeClock.iss`): no `AppMutex`. `PrepareToInstall`
+(after the user clicks Install, so cancelling the wizard leaves the clock
+alone) posts `WM_COMMAND ID_MENU_EXIT` — the tray's own Exit, which every
+version handles — and waits up to 5 s for the mutex. `[Run]` restarts it when
+it was running (`ClockWasRunning`, silent installs too, `runasoriginaluser` so
+it is not elevated); a fresh install keeps the usual checkbox. If it will not
+close, Setup stops on the Preparing page with a message, before touching files.
+
+**Uninstaller**: `unins000.dat` keeps the `AppMutex` of every earlier install,
+so dropping the directive does not reach existing installs. The clock is closed
+in `CurUninstallStepChanged(usAppMutexCheck)`, which runs after "Are you
+sure?" (verified: answering No leaves it running) and just before that stale
+check; `Abort` there if it will not close.
+
+**App**: `ID_MENU_EXIT` goes through `RequestQuit`. Destroying the main window
+under a running modal loop (Settings, a font/colour/file picker, a message
+box) unwound that loop into a dead window after `GdiplusShutdown`. Now the
+innermost modal gets `WM_CLOSE` (= Cancel; Settings reverts its preview) and
+timer 4 retries until none is left. `EndMenu` cancels a tracking tray menu.
+
+**Verified on a real install**: 1.7.2 running → 1.7.3 silent (back as 1.7.3,
+not elevated); upgrade with Settings open, with the font picker over Settings,
+with the Import dialog open (all closed cleanly, nothing left behind); not
+running → not started; uninstall while running (closed in 300 ms, Run value
+removed); reinstall. No crash/hang events. Note for scripted tests:
+`Start-Process -Wait` also waits for the relaunched clock (a child), so use
+`$p.WaitForExit()`; and PowerShell passes `$null` to a `string` P/Invoke
+parameter as `""`, so `FindWindowW(class, $null)` never matches a titled window.
