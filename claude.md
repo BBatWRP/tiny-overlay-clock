@@ -228,7 +228,7 @@ pre-sleep ticks — the sibling of the existing `WM_TIMECHANGE` handler.
 `EvaluateVisibility` early-returns in two compares in that state, so the saving
 is noise, and it adds a way for the clock to never come back.
 
-## Review fixes (2026-11-22, unreleased — version still 1.7.1)
+## v1.7.2 — review fixes (2026-11-22)
 **Placement is anchored to the work area** (`g_work`), not the monitor rect.
 Identical with an auto-hide taskbar (verified: work area == monitor here). With
 an always-visible taskbar the clock now sits beside it; before, the bar counted
