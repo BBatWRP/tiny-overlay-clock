@@ -8,11 +8,11 @@ EdgeClock blends seamlessly into your desktop environment, providing time withou
 
 ## 🚀 Features
 
-* **Edge-Clinging Design**: Snaps perfectly to the bottom-right of your screen, blending into your current workflow.
-* **Multi-Monitor Aware**: Automatically follows the monitor hosting your taskbar.
-* **Smart Auto-Hide**: Slides out of view on hover, when a raised taskbar would cover it (any edge), or when an app goes fullscreen **on the clock's own monitor** — a fullscreen video on another display leaves it alone. Detected via the Windows shell (D3D games, F11 fullscreen, presentation mode) plus a check of the window actually covering that monitor.
+* **Edge-Clinging Design**: Snaps to the bottom-right of your screen by default, blending into your current workflow.
+* **Multi-Monitor Aware**: Automatically follows the monitor hosting your taskbar. A monitor you pick that is later unplugged is remembered and shown as "(not connected)" rather than silently reset.
+* **Smart Auto-Hide**: Slides out of view on hover, when a raised taskbar would cover it (any edge), or when an app goes fullscreen **on the clock's own monitor** — a fullscreen video on another display leaves it alone, and it comes straight back when you alt-tab out of a game. Detected via the Windows shell (D3D games, F11 fullscreen, presentation mode) plus a check of the window actually covering that monitor; overlays and click-through windows never count.
 * **Works With Any Taskbar**: With auto-hide the clock sits at the very edge; with an always-visible taskbar it sits right beside it instead of being hidden behind it.
-* **Custom Time Format**: Pick a preset (24-hour, 12-hour, with seconds, with date) or write any `strftime` pattern yourself.
+* **Custom Time Format**: Pick a preset (24-hour, 12-hour, with seconds, with date) or write any `strftime` pattern yourself — the box turns red while the pattern is invalid.
 * **Text Effects**: Outline, Soft Shadow, Glow, or a translucent Pill plate — with adjustable strength.
 * **Any Corner, Any Monitor**: Place the clock in any of the four corners, on the monitor of your choice.
 * **Opacity Control**: Blend the clock into your wallpaper at 20–100% opacity, with a fade on every slide.
@@ -24,9 +24,9 @@ EdgeClock blends seamlessly into your desktop environment, providing time withou
   * Wakes only on the second/minute boundary the display can actually change on — not on a fixed poll.
   * Animation re-presents a cached surface instead of re-rendering, so sliding and fading cost no drawing work.
   * While hidden it stops keeping time altogether — there is nothing on screen to keep current, so the clock redraws on the way back into view instead. Hidden by the tray menu, it runs **no timers at all** and sleeps until you ask for it back.
-  * Returns its memory to the OS immediately after every redraw, and releases the render surface itself while hidden, so the resident set sits around **0.8 MB** and the whole executable is only 166 KB.
+  * Returns its memory to the OS immediately after every redraw, and releases the render surface itself while hidden, so the resident set sits around **0.8 MB** and the whole executable is only 120 KB.
   * Measured against v1.5: **~60% less CPU and ~90% less memory** while idle.
-* **Modern Settings Interface**: A dark-themed, sleek configuration dialog to customize your experience.
+* **Modern Settings Interface**: A dark-themed configuration dialog that opens on the monitor you're using, scales correctly at any display scaling, and works fully from the keyboard.
 * **Fully Customizable**:
   * **Typography**: Select any installed system font and tweak size easily.
   * **Colors**: Personalize the text and outline colors to match your wallpaper.
@@ -59,7 +59,7 @@ graph TD
     
     G -->|Armed to next boundary| H[Update Time]
     G -->|Adaptive 120-1000ms| I[Check Window Status & Mouse Hover]
-    G -->|Timer 10ms| J[Process Smooth Slide Animation]
+    G -->|Timer 16ms| J[Process Smooth Slide Animation]
     G -->|WinEvent hooks| I
     
     H --> K[Update Layered Window Content]
@@ -84,8 +84,8 @@ graph TD
 
 **Option 1: Windows Installer (Recommended)**
 1. Navigate to the [Releases](https://github.com/BBatWRP/tiny-overlay-clock/releases) page.
-2. Download `EdgeClock_Setup.exe`.
-3. Follow the installation wizard.
+2. Download `EdgeClockSetup_v1.7.2.exe` (or the newest `EdgeClockSetup_v*.exe`).
+3. Follow the installation wizard. Upgrading? Exit EdgeClock from the tray first; the installer updates your existing install in place and keeps your settings.
 
 **Option 2: Portable Executable**
 1. Download `EdgeClock.exe` from [Releases](https://github.com/BBatWRP/tiny-overlay-clock/releases).
@@ -95,7 +95,7 @@ graph TD
 
 1. Launch `EdgeClock.exe`. The clock will appear smoothly in the bottom-right corner.
 2. **Right-click** the EdgeClock system tray icon to access the menu, or **left-click** it to open Settings directly.
-3. In **Settings** you can customize font, size, colors, time format, opacity, offsets, and animation speed — changes preview live as you adjust them.
+3. In **Settings** you can customize font, size, colors, time format, effects, opacity, corner, monitor, offsets, and animation speed — changes preview live as you adjust them.
 4. Toggle **Run on Startup** to have EdgeClock launch automatically when you log into Windows.
 
 ---
@@ -113,10 +113,12 @@ EdgeClock is simple to build with minimal dependencies.
 # 1. Compile the resource file
 windres EdgeClock.rc -o resource.o
 # 2. Compile the executable
-g++ -o EdgeClock.exe EdgeClock.cpp resource.o -lgdi32 -luser32 -lgdiplus -lcomdlg32 -lole32 -luuid -mwindows -ldwmapi -lcomctl32 -static
+g++ -o EdgeClock.exe EdgeClock.cpp resource.o -Os -fno-exceptions -fno-rtti -ffunction-sections -fdata-sections -Wl,--gc-sections -s -lgdi32 -luser32 -lgdiplus -lcomdlg32 -lole32 -luuid -mwindows -ldwmapi -lcomctl32 -luxtheme -static
 ```
 
 Alternatively, just double-click `build.bat` included in the root directory.
+
+**Checks:** run `check.bat` before a release. It runs two warning passes, a GDI handle-pairing audit, and `tests/selftest.cpp` (placement, taskbar overlap, time formats, Thai day names). It is offline and needs nothing beyond MinGW.
 
 ---
 
