@@ -46,6 +46,11 @@ Name: "startup"; Description: "Run on startup"; GroupDescription: "Additional ta
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "EdgeClock"; ValueData: """{app}\EdgeClock.exe"""; Flags: uninsdeletevalue; Tasks: startup
+; The app's own "Run on Startup" toggle writes the same value, and the line
+; above only cleans up after itself when its task was ticked at install. This
+; entry writes nothing (ValueType: none) and always removes the value on
+; uninstall, so no Run entry is left pointing at a deleted exe.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "EdgeClock"; Flags: uninsdeletevalue
 
 [Run]
 Filename: "{app}\EdgeClock.exe"; Description: "Launch EdgeClock"; Flags: nowait postinstall skipifsilent runasoriginaluser

@@ -1,4 +1,8 @@
 @echo off
+setlocal
+REM Pass --no-pause to run it unattended (CI, scripts).
+set "NOPAUSE="
+if /i "%~1"=="--no-pause" set "NOPAUSE=1"
 echo Compiling EdgeClock...
 windres EdgeClock.rc -o resource.o
 
@@ -16,9 +20,9 @@ g++ -o EdgeClock.exe EdgeClock.cpp resource.o ^
 
 if %errorlevel% neq 0 (
     echo Compilation failed!
-    pause
+    if not defined NOPAUSE pause
     exit /b %errorlevel%
 )
 echo Compilation successful! EdgeClock.exe created.
 if exist resource.o del resource.o
-pause
+if not defined NOPAUSE pause

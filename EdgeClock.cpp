@@ -9,6 +9,7 @@
 #include <tchar.h>
 #include <ctime>
 #include <stdio.h> // For file logging
+#include <locale.h>
 #include <gdiplus.h>
 #include <shellapi.h>
 #include <shobjidl.h>
@@ -282,6 +283,7 @@ enum StrId {
     S_MENU_LANG, S_LANG_AUTO, S_LANG_EN, S_LANG_TH,
     S_MENU_EXPORT, S_MENU_IMPORT,
     S_FILE_FILTER, S_IMPORT_OK, S_IMPORT_FAIL, S_EXPORT_FAIL,
+    S_MON_MISSING,
     S_COUNT
 };
 
@@ -302,7 +304,8 @@ static const WCHAR* kStrEN[S_COUNT] = {
     L"Language", L"Auto (system)", L"English", L"Thai",
     L"Export Settings…", L"Import Settings…",
     L"EdgeClock settings", L"Settings imported.", L"Could not read that settings file.",
-    L"Could not write the settings file."
+    L"Could not write the settings file.",
+    L"%s (not connected)"
 };
 
 static const WCHAR* kStrTH[S_COUNT] = {
@@ -322,7 +325,8 @@ static const WCHAR* kStrTH[S_COUNT] = {
     L"ภาษา", L"อัตโนมัติ (ตามระบบ)", L"English", L"ไทย",
     L"ส่งออกการตั้งค่า…", L"นำเข้าการตั้งค่า…",
     L"ไฟล์ตั้งค่า EdgeClock", L"นำเข้าการตั้งค่าแล้ว", L"อ่านไฟล์ตั้งค่าไม่ได้",
-    L"เขียนไฟล์ตั้งค่าไม่ได้"
+    L"เขียนไฟล์ตั้งค่าไม่ได้",
+    L"%s (ไม่ได้เชื่อมต่อ)"
 };
 
 static const WCHAR** g_str = kStrEN;
@@ -335,6 +339,14 @@ void ApplyLanguage() {
         lang = ((GetUserDefaultUILanguage() & 0x3FF) == 0x1E /*LANG_THAI*/) ? 2 : 1;
     }
     g_str = (lang == 2) ? kStrTH : kStrEN;
+
+    // Day/month names (%a %A %b %B) and %c/%x come from the CRT's LC_TIME,
+    // which is "C" unless set — so Thai mode used to show "Sun 22 Nov".
+    // Thai uses the msvcrt locale name (it rejects "th-TH"; measured), which
+    // also gives the Buddhist-era year in %c/%x, as Thai readers expect.
+    // English is "C", not "en-US": msvcrt rejects that name too.
+    if (lang == 2 && _wsetlocale(LC_TIME, L"Thai_Thailand.874")) return;
+    _wsetlocale(LC_TIME, L"C");
 }
 
 inline const WCHAR* L(int id) { return g_str[id]; }
@@ -416,13 +428,19 @@ NOTIFYICONDATA nid = { 0 };
 // --- Monitor geometry ---
 #define EC_MAX_MONITORS 8
 RECT g_mon = {0, 0, 0, 0};            // Rect of the monitor the clock lives on
+RECT g_work = {0, 0, 0, 0};           // That monitor's work area (the clock's anchor)
+HMONITOR g_hMonClock = NULL;          // That monitor's handle
 RECT g_monRects[EC_MAX_MONITORS];
+HMONITOR g_monHandles[EC_MAX_MONITORS];
 int  g_monCount = 0;
 
 BOOL CALLBACK MonEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM) {
     if (g_monCount < EC_MAX_MONITORS) {
         MONITORINFO mi = { sizeof(mi) };
-        if (GetMonitorInfo(hMon, &mi)) g_monRects[g_monCount++] = mi.rcMonitor;
+        if (GetMonitorInfo(hMon, &mi)) {
+            g_monHandles[g_monCount] = hMon;
+            g_monRects[g_monCount++] = mi.rcMonitor;
+        }
     }
     return TRUE;
 }
@@ -433,47 +451,59 @@ void UpdateScreenMetrics() {
     g_monCount = 0;
     EnumDisplayMonitors(NULL, NULL, MonEnumProc, 0);
 
-    if (Config::monitorIndex >= 1 && Config::monitorIndex <= g_monCount) {
-        g_mon = g_monRects[Config::monitorIndex - 1];
-        return;
-    }
-
-    HWND hTray = FindWindow(_T("Shell_TrayWnd"), NULL);
     HMONITOR hMon;
-    if (hTray) {
-        hMon = MonitorFromWindow(hTray, MONITOR_DEFAULTTOPRIMARY);
+    if (Config::monitorIndex >= 1 && Config::monitorIndex <= g_monCount) {
+        hMon = g_monHandles[Config::monitorIndex - 1];
     } else {
-        POINT pt = {0, 0};
-        hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+        HWND hTray = FindWindow(_T("Shell_TrayWnd"), NULL);
+        if (hTray) {
+            hMon = MonitorFromWindow(hTray, MONITOR_DEFAULTTOPRIMARY);
+        } else {
+            POINT pt = {0, 0};
+            hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+        }
     }
     MONITORINFO mi = { sizeof(mi) };
     if (GetMonitorInfo(hMon, &mi)) {
+        g_hMonClock = hMon;
         g_mon = mi.rcMonitor;
+        g_work = mi.rcWork;
     } else {
+        g_hMonClock = NULL;
         SetRect(&g_mon, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        g_work = g_mon;
     }
 }
 
 // --- Corner-aware placement -------------------------------------------------
 // corner: 0 = bottom-right, 1 = bottom-left, 2 = top-right, 3 = top-left.
+//
+// The clock is anchored to the WORK AREA, not the raw monitor rect. With an
+// auto-hide taskbar the two are identical, so nothing changes there. With an
+// always-visible taskbar the work area stops at the taskbar's edge, so the
+// clock sits right next to it instead of underneath it — where the old
+// monitor-rect anchor made the taskbar count as "raised" forever and the clock
+// never appeared at all.
 inline bool ClockAtBottom() { return Config::corner == 0 || Config::corner == 1; }
 inline bool ClockAtRight()  { return Config::corner == 0 || Config::corner == 2; }
 
 // X of the clock window (absolute), honouring offsetX away from its edge.
 int ClockX() {
-    return ClockAtRight() ? g_mon.right - clockSize.cx - (int)Config::offsetX
-                          : g_mon.left + (int)Config::offsetX;
+    return ClockAtRight() ? g_work.right - clockSize.cx - (int)Config::offsetX
+                          : g_work.left + (int)Config::offsetX;
 }
 
 // Y when fully visible.
 int VisibleY() {
-    return ClockAtBottom() ? g_mon.bottom - clockSize.cy - (int)Config::offsetY
-                           : g_mon.top + (int)Config::offsetY;
+    return ClockAtBottom() ? g_work.bottom - clockSize.cy - (int)Config::offsetY
+                           : g_work.top + (int)Config::offsetY;
 }
 
-// Y when fully hidden — just past the monitor edge the clock slides toward.
+// Y when fully hidden — just past the edge the clock slides toward. The fade
+// reaches zero exactly here, so stopping at the work-area edge (on top of a
+// permanent taskbar) leaves nothing visible.
 int HiddenY() {
-    return ClockAtBottom() ? g_mon.bottom : g_mon.top - clockSize.cy;
+    return ClockAtBottom() ? g_work.bottom : g_work.top - clockSize.cy;
 }
 
 void GetTime(TCHAR* buffer, int size) {
@@ -863,6 +893,14 @@ bool RefreshClockText(HWND hwnd) {
     return true;
 }
 
+bool g_ownTrayIcon = false; // nid.hIcon came from LoadImage and must be destroyed
+
+void DestroyTrayIconImage() {
+    if (g_ownTrayIcon && nid.hIcon) DestroyIcon(nid.hIcon);
+    nid.hIcon = NULL;
+    g_ownTrayIcon = false;
+}
+
 void InitTrayIcon(HWND hwnd) {
     nid.cbSize = sizeof(NOTIFYICONDATA);
     nid.hWnd = hwnd;
@@ -870,8 +908,15 @@ void InitTrayIcon(HWND hwnd) {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     
-    // Load Icon from Resource (ID 101)
-    nid.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(101));
+    // Load icon resource 101 at the tray's real size. LoadIcon always picks the
+    // 32 px (SM_CXICON) image and the shell shrinks it, which blurs it. The .ico
+    // carries 16-128 px images, so this picks the exact one for the DPI (20 px
+    // at 125%, 24 px at 150%...). LoadIconMetric would do the same but needs
+    // comctl32 v6 at load time; without the manifest the exe would not start.
+    // Not LR_SHARED, so it is destroyed in DestroyTrayIconImage().
+    nid.hIcon = (HICON)LoadImage(GetModuleHandle(NULL), MAKEINTRESOURCE(101), IMAGE_ICON,
+                                 GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    g_ownTrayIcon = (nid.hIcon != NULL);
     if (!nid.hIcon) {
         nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     }
@@ -995,7 +1040,10 @@ bool ExportSettings(HWND owner) {
     return true;
 }
 
-bool ImportSettings(HWND owner) {
+// Returns 1 = imported, 0 = unreadable file, -1 = user cancelled the picker.
+// (It returned true for a cancel, and the caller then announced "Settings
+// imported." for a file that was never chosen.)
+int ImportSettings(HWND owner) {
     WCHAR path[MAX_PATH] = {0};
     WCHAR filter[128];
     _sntprintf(filter, 100, L"%s (*.txt)", L(S_FILE_FILTER));
@@ -1012,7 +1060,7 @@ bool ImportSettings(HWND owner) {
     ofn.lpstrFile = path;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-    if (!GetOpenFileNameW(&ofn)) return true; // Cancelled
+    if (!GetOpenFileNameW(&ofn)) return -1; // Cancelled: nothing to report
 
     FILE* f = _wfopen(path, L"rb");
     if (!f) return false;
@@ -1130,6 +1178,8 @@ struct ConfigSnapshot {
 } g_cfgSnapshot;
 bool g_settingsReady = false; // Suppress preview during WM_CREATE init
 bool g_settingsOpen = false;  // Re-entry guard (tray clicks reach the disabled parent)
+bool g_fmtInvalid = false;    // Custom format box holds an unusable format (painted red)
+bool g_uiBusy = false;        // A tray-launched modal (file dialog, message box) is up
 
 void RecalculateAll(HWND hwnd); // fwd decl
 
@@ -1150,9 +1200,16 @@ void ApplyPreview(HWND hwnd) {
     GetDlgItemText(hwnd, ID_EDIT_OFFSET_Y, buf, 64);
     Config::offsetY = (float)_wtof(buf);
 
+    // An invalid format is never applied (the clock keeps the last good one),
+    // so the box turns red to say why typing seems to do nothing.
     GetDlgItemText(hwnd, ID_EDIT_TIME_FORMAT, buf, 64);
     buf[31] = L'\0';
-    if (IsValidTimeFormat(buf)) lstrcpyW(Config::timeFormat, buf);
+    bool fmtOk = IsValidTimeFormat(buf);
+    if (fmtOk) lstrcpyW(Config::timeFormat, buf);
+    if (g_fmtInvalid == fmtOk) {
+        g_fmtInvalid = !fmtOk;
+        InvalidateRect(GetDlgItem(hwnd, ID_EDIT_TIME_FORMAT), NULL, TRUE);
+    }
 
     Config::animDuration = (int)SendMessage(GetDlgItem(hwnd, ID_TRACK_ANIM_SPEED), TBM_GETPOS, 0, 0) * 100;
 
@@ -1173,8 +1230,12 @@ void ApplyPreview(HWND hwnd) {
     int cn = (int)SendMessage(GetDlgItem(hwnd, ID_COMBO_CORNER), CB_GETCURSEL, 0, 0);
     if (cn >= 0 && cn <= 3) Config::corner = cn;
 
-    int mi = (int)SendMessage(GetDlgItem(hwnd, ID_COMBO_MONITOR), CB_GETCURSEL, 0, 0);
-    if (mi >= 0 && mi <= g_monCount) Config::monitorIndex = mi;
+    HWND hMonCombo = GetDlgItem(hwnd, ID_COMBO_MONITOR);
+    int monSel = (int)SendMessage(hMonCombo, CB_GETCURSEL, 0, 0);
+    if (monSel >= 0) {
+        int mi = (int)SendMessage(hMonCombo, CB_GETITEMDATA, monSel, 0);
+        if (mi >= 0 && mi <= EC_MAX_MONITORS) Config::monitorIndex = mi;
+    }
 
     Config::textColor = tempTextColor;
     Config::outlineColor = tempOutlineColor;
@@ -1216,6 +1277,7 @@ void RevertPreview(HWND hwnd) {
 HBRUSH hBrushDark = NULL;
 HBRUSH hBrushEdit = NULL;
 HBRUSH hBrushSep = NULL;
+HBRUSH hBrushBad = NULL;
 HFONT hFontSegoe = NULL;
 
 // --- DPI scaling for the Settings dialog ------------------------------------
@@ -1244,6 +1306,43 @@ int QueryDpi(HWND hwnd) {
 }
 
 inline int DS(int v) { return MulDiv(v, g_dlgDpi, 96); }
+
+// The finished layout is ~596x466 logical units. At very high scaling (250%+)
+// that would not fit the work area and the button row would fall off the
+// bottom, so the layout scale is capped to what fits on the given monitor.
+int CapDlgDpi(int dpi, HMONITOR hMon) {
+    MONITORINFO mi;
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfo(hMon, &mi)) {
+        int maxByH = MulDiv(96, mi.rcWork.bottom - mi.rcWork.top, 466);
+        int maxByW = MulDiv(96, mi.rcWork.right - mi.rcWork.left, 596);
+        int cap = maxByH < maxByW ? maxByH : maxByW;
+        if (cap >= 96 && dpi > cap) return cap;
+    }
+    return dpi;
+}
+
+// Client -> window rect for a given DPI. Under PerMonitorV2 the caption and
+// borders scale with the monitor, which plain AdjustWindowRectEx (system DPI)
+// gets wrong on a secondary monitor; the ForDpi variant is Windows 10 1607+.
+void AdjustRectForDpi(RECT* rc, HWND hwnd, UINT dpi) {
+    typedef BOOL (WINAPI *AdjustForDpiFn)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    static AdjustForDpiFn pAdjust = NULL;
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        HMODULE hUser = GetModuleHandle(_T("user32.dll"));
+        if (hUser) pAdjust = (AdjustForDpiFn)(void*)GetProcAddress(hUser, "AdjustWindowRectExForDpi");
+    }
+    DWORD style = (DWORD)GetWindowLongPtr(hwnd, GWL_STYLE);
+    DWORD exStyle = (DWORD)GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    if (pAdjust) pAdjust(rc, style, FALSE, exStyle, dpi);
+    else AdjustWindowRectEx(rc, style, FALSE, exStyle);
+}
+
+// Logical (96-DPI) client size of the finished layout, recorded by WM_CREATE
+// so WM_DPICHANGED can resize the window without re-running the layout.
+int g_dlgClientW96 = 0, g_dlgClientH96 = 0;
 
 void SetModernFont(HWND hwnd) {
     if (!hFontSegoe) {
@@ -1339,25 +1438,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
     switch(uMsg) {
         case WM_CREATE: {
             g_settingsReady = false;
-            g_dlgDpi = QueryDpi(hwnd);
-
-            // The finished layout is ~596x466 logical units. At very high
-            // scaling (250%+) that would not fit the work area, and the button
-            // row would fall off the bottom — so cap the scale to what fits.
-            {
-                POINT ptc;
-                GetCursorPos(&ptc);
-                MONITORINFO mic;
-                mic.cbSize = sizeof(mic);
-                if (GetMonitorInfo(MonitorFromPoint(ptc, MONITOR_DEFAULTTOPRIMARY), &mic)) {
-                    int workH = mic.rcWork.bottom - mic.rcWork.top;
-                    int workW = mic.rcWork.right - mic.rcWork.left;
-                    int maxByH = MulDiv(96, workH, 466);
-                    int maxByW = MulDiv(96, workW, 596);
-                    int cap = maxByH < maxByW ? maxByH : maxByW;
-                    if (cap >= 96 && g_dlgDpi > cap) g_dlgDpi = cap;
-                }
-            }
+            // DoSettingsDialog creates the window on the monitor under the
+            // cursor, so this is already that monitor's DPI.
+            g_dlgDpi = CapDlgDpi(QueryDpi(hwnd), MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY));
 
             // Snapshot live config for Cancel/revert (live preview writes to Config)
             g_cfgSnapshot.fontSize = Config::fontSize;
@@ -1380,6 +1463,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             hBrushDark = CreateSolidBrush(RGB(32, 32, 32)); // Dark Background
             hBrushEdit = CreateSolidBrush(RGB(50, 50, 50)); // Darker Grey Edit Fields
             hBrushSep  = CreateSolidBrush(RGB(70, 70, 70)); // Section separator lines
+            hBrushBad  = CreateSolidBrush(RGB(110, 40, 40)); // Invalid custom format
+            g_fmtInvalid = false;
 
             // Two-column layout, authored at 96 DPI and scaled via DS().
             const int LX = 16, LLW = 74, LCX = 94, LCW = 176;   // left column
@@ -1447,6 +1532,10 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             // Custom strftime string
             LABEL(L(S_CUSTOM), LX, y, LLW);
             HWND hFmt = EDIT(LCX, y, LCW, ID_EDIT_TIME_FORMAT);
+            // Config::timeFormat is 32 WCHARs. Without a limit, characters past
+            // 31 were silently cut off, which could split a %-code and make
+            // the whole format invalid.
+            SendMessage(hFmt, EM_LIMITTEXT, 31, 0);
             SetWindowText(hFmt, Config::timeFormat);
             // Read-only (not disabled) when a preset is active: stays legible
             // on the dark theme and the user can still see/copy the format
@@ -1516,14 +1605,33 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             LABEL(L(S_MONITOR), RX, y, RLW);
             HWND hMonCombo = COMBO(RCX, y, RCW, ID_COMBO_MONITOR);
             SetWindowTheme(hMonCombo, L"DarkMode_CFD", NULL);
-            SendMessage(hMonCombo, CB_ADDSTRING, 0, (LPARAM)L(S_AUTO));
-            for (int i = 1; i <= g_monCount; ++i) {
-                _sntprintf(buf, 64, L(S_MONITOR_N), i);
-                buf[63] = _T('\0');
-                SendMessage(hMonCombo, CB_ADDSTRING, 0, (LPARAM)buf);
+            // Each entry carries its monitor number as item data, so the list
+            // can hold a saved monitor that is unplugged right now. Showing
+            // "Auto" for it instead meant pressing Save quietly forgot the
+            // user's choice while a laptop was undocked.
+            {
+                int selIdx = 0;
+                LRESULT at = SendMessage(hMonCombo, CB_ADDSTRING, 0, (LPARAM)L(S_AUTO));
+                SendMessage(hMonCombo, CB_SETITEMDATA, at, 0);
+                for (int i = 1; i <= g_monCount; ++i) {
+                    _sntprintf(buf, 64, L(S_MONITOR_N), i);
+                    buf[63] = _T('\0');
+                    at = SendMessage(hMonCombo, CB_ADDSTRING, 0, (LPARAM)buf);
+                    SendMessage(hMonCombo, CB_SETITEMDATA, at, i);
+                    if (i == Config::monitorIndex) selIdx = (int)at;
+                }
+                if (Config::monitorIndex > g_monCount) {
+                    TCHAR name[32];
+                    _sntprintf(name, 32, L(S_MONITOR_N), Config::monitorIndex);
+                    name[31] = _T('\0');
+                    _sntprintf(buf, 64, L(S_MON_MISSING), name);
+                    buf[63] = _T('\0');
+                    at = SendMessage(hMonCombo, CB_ADDSTRING, 0, (LPARAM)buf);
+                    SendMessage(hMonCombo, CB_SETITEMDATA, at, Config::monitorIndex);
+                    selIdx = (int)at;
+                }
+                SendMessage(hMonCombo, CB_SETCURSEL, selIdx, 0);
             }
-            SendMessage(hMonCombo, CB_SETCURSEL,
-                        (Config::monitorIndex <= g_monCount ? Config::monitorIndex : 0), 0);
 
             y += GAP;
             // Offsets — allow negative & float (no ES_NUMBER)
@@ -1551,9 +1659,10 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
             // Size the window to the finished layout and centre it on the
             // monitor under the cursor (all in physical pixels).
-            RECT rcNeed = { 0, 0, DS(RX + 282), DS(by + 30 + 14) };
-            AdjustWindowRectEx(&rcNeed, (DWORD)GetWindowLongPtr(hwnd, GWL_STYLE), FALSE,
-                               (DWORD)GetWindowLongPtr(hwnd, GWL_EXSTYLE));
+            g_dlgClientW96 = RX + 282;
+            g_dlgClientH96 = by + 30 + 14;
+            RECT rcNeed = { 0, 0, DS(g_dlgClientW96), DS(g_dlgClientH96) };
+            AdjustRectForDpi(&rcNeed, hwnd, (UINT)QueryDpi(hwnd));
             int wndW = rcNeed.right - rcNeed.left;
             int wndH = rcNeed.bottom - rcNeed.top;
 
@@ -1600,6 +1709,10 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
         case WM_CTLCOLOREDIT:
             SetTextColor((HDC)wParam, RGB(255, 255, 255)); // White Text
+            if (g_fmtInvalid && GetDlgCtrlID((HWND)lParam) == ID_EDIT_TIME_FORMAT) {
+                SetBkColor((HDC)wParam, RGB(110, 40, 40)); // Invalid format
+                return (INT_PTR)hBrushBad;
+            }
             SetBkColor((HDC)wParam, RGB(50, 50, 50)); // Dark Grey Background
             return (INT_PTR)hBrushEdit;
 
@@ -1733,8 +1846,17 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                     SetWindowText(hEdit, kFormatPresets[sel]);
                 } else { // Custom…
                     SendMessage(hEdit, EM_SETREADONLY, FALSE, 0);
-                    SetFocus(hEdit);
+                    // Not while the list is still open: arrowing onto
+                    // "Custom…" used to yank focus into the box and close the
+                    // list, so the user's next Enter hit Save. CBN_CLOSEUP
+                    // below hands focus over once the choice is final.
+                    if (!SendMessage((HWND)lParam, CB_GETDROPPEDSTATE, 0, 0)) SetFocus(hEdit);
                 }
+                break;
+            }
+            if (HIWORD(wParam) == CBN_CLOSEUP && wmId == ID_COMBO_FORMAT) {
+                if ((int)SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0) == kNumFormatPresets)
+                    SetFocus(GetDlgItem(hwnd, ID_EDIT_TIME_FORMAT)); // Not WM_NEXTDLGCTL: plain window, no dialog manager
                 break;
             }
 
@@ -1749,9 +1871,18 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                     cf.lStructSize = sizeof(cf);
                     cf.hwndOwner = hwnd;
                     cf.lpLogFont = &lf;
-                    // CF_NOSIZESEL hides the size list, removing redundancy
-                    cf.Flags = CF_SCREENFONTS | CF_EFFECTS | CF_INITTOLOGFONTSTRUCT | CF_NOSIZESEL;
+                    // CF_NOSIZESEL hides the size list (Size has its own box).
+                    // No CF_EFFECTS: its colour/underline/strikeout controls
+                    // were silently ignored. The style list (Bold/Italic) is
+                    // kept and drives the Weight combo, so it is no longer
+                    // thrown away either.
+                    cf.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_NOSIZESEL;
                     lstrcpyW(lf.lfFaceName, tempFontName);
+                    {
+                        int w = (int)SendMessage(GetDlgItem(hwnd, ID_COMBO_WEIGHT), CB_GETCURSEL, 0, 0);
+                        lf.lfWeight = (w == 1 || w == 3) ? FW_BOLD : FW_NORMAL;
+                        lf.lfItalic = (w == 2 || w == 3) ? TRUE : FALSE;
+                    }
                     
                     // We still init lfHeight for the sample text in the dialog
                     HDC hdc = GetDC(hwnd);
@@ -1763,6 +1894,12 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
                     if (ChooseFont(&cf)) {
                         lstrcpyW(tempFontName, lf.lfFaceName);
+                        // Map the picked style onto the four styles GDI+ has.
+                        // Light/Thin faces map to Regular (see Known Issues).
+                        bool bold = lf.lfWeight >= FW_SEMIBOLD;
+                        bool italic = lf.lfItalic != 0;
+                        int w = bold ? (italic ? 3 : 1) : (italic ? 2 : 0);
+                        SendMessage(GetDlgItem(hwnd, ID_COMBO_WEIGHT), CB_SETCURSEL, w, 0);
                         SetWindowText(GetDlgItem(hwnd, ID_STATIC_FONT_NAME), tempFontName);
                         ApplyPreview(hwnd);
                     }
@@ -1860,6 +1997,50 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             }
             break;
         }
+        case 0x02E0 /*WM_DPICHANGED*/: {
+            // Dragged onto a monitor with different scaling. Under PerMonitorV2
+            // Windows rescales nothing for us, so rescale every control's
+            // rect and the font by new/old, then size the window to the
+            // layout at the new scale (not Windows' suggestion, which ignores
+            // the work-area cap).
+            const RECT* sug = (const RECT*)lParam;
+            UINT newDpi = HIWORD(wParam);
+            int oldDlg = g_dlgDpi;
+            int newDlg = CapDlgDpi((int)newDpi, MonitorFromRect(sug, MONITOR_DEFAULTTONEAREST));
+
+            if (newDlg != oldDlg) {
+                g_dlgDpi = newDlg;
+                HFONT hOldFont = hFontSegoe;
+                hFontSegoe = NULL; // SetModernFont recreates it at the new DPI
+                for (HWND c = GetWindow(hwnd, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+                    RECT rc;
+                    GetWindowRect(c, &rc);
+                    MapWindowPoints(NULL, hwnd, (LPPOINT)&rc, 2);
+                    int x = MulDiv(rc.left, newDlg, oldDlg);
+                    int y = MulDiv(rc.top, newDlg, oldDlg);
+                    int w = MulDiv(rc.right - rc.left, newDlg, oldDlg);
+                    int h = MulDiv(rc.bottom - rc.top, newDlg, oldDlg);
+                    // A drop-down combo's window height is its LIST height;
+                    // its rect reports only the closed field, so use the
+                    // height it was created with.
+                    TCHAR cls[16];
+                    if (GetClassName(c, cls, 16) && lstrcmpi(cls, _T("ComboBox")) == 0) h = DS(220);
+                    if (hOldFont && (HFONT)SendMessage(c, WM_GETFONT, 0, 0) == hOldFont)
+                        SetModernFont(c);
+                    MoveWindow(c, x, y, w, h, FALSE);
+                }
+                if (hOldFont) DeleteObject(hOldFont);
+            }
+
+            RECT rcNeed = { 0, 0, DS(g_dlgClientW96), DS(g_dlgClientH96) };
+            AdjustRectForDpi(&rcNeed, hwnd, newDpi);
+            SetWindowPos(hwnd, NULL, sug->left, sug->top,
+                         rcNeed.right - rcNeed.left, rcNeed.bottom - rcNeed.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            InvalidateRect(hwnd, NULL, TRUE);
+            return 0;
+        }
+
         case WM_CLOSE:
             RevertPreview(hwnd); // X button = Cancel
             DestroyWindow(hwnd);
@@ -1870,6 +2051,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             if (hBrushDark) { DeleteObject(hBrushDark); hBrushDark = NULL; }
             if (hBrushEdit) { DeleteObject(hBrushEdit); hBrushEdit = NULL; }
             if (hBrushSep)  { DeleteObject(hBrushSep);  hBrushSep = NULL; }
+            if (hBrushBad)  { DeleteObject(hBrushBad);  hBrushBad = NULL; }
             if (hFontSegoe) { DeleteObject(hFontSegoe); hFontSegoe = NULL; }
             break;
     }
@@ -1891,14 +2073,30 @@ void DoSettingsDialog(HWND parent) {
     }
     
     // WM_CREATE lays the controls out and resizes/centres the window for the
-    // actual DPI, so the initial size here is only a placeholder.
+    // actual DPI, so the initial size here is only a placeholder. The initial
+    // POSITION matters though: it must already be on the monitor under the
+    // cursor, because that is what WM_CREATE's DPI query sees. CW_USEDEFAULT
+    // put it on the primary monitor and the layout came out at the wrong
+    // scale once it was moved to a monitor with different scaling.
+    POINT ptCur;
+    GetCursorPos(&ptCur);
+    MONITORINFO mi;
+    mi.cbSize = sizeof(mi);
+    RECT area;
+    if (GetMonitorInfo(MonitorFromPoint(ptCur, MONITOR_DEFAULTTOPRIMARY), &mi)) area = mi.rcWork;
+    else SetRect(&area, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+
+    // Hidden until laid out, so it never flashes at the placeholder spot
     HWND hDlg = CreateWindowEx(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, CLASS_NAME, L(S_TITLE),
-        WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 600, 480, parent, NULL, GetModuleHandle(NULL), NULL);
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        area.left, area.top, 600, 480, parent, NULL, GetModuleHandle(NULL), NULL);
+    if (!hDlg) { g_settingsOpen = false; return; }
     
     // Enable Dark Mode for Title Bar
     BOOL useDarkMode = TRUE;
     DwmSetWindowAttribute(hDlg, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
+    ShowWindow(hDlg, SW_SHOW); // After the dark caption is set: no white flash
+    SetForegroundWindow(hDlg);
 
     EnableWindow(parent, FALSE);
     MSG msg;
@@ -1997,6 +2195,68 @@ HWINEVENTHOOK g_hookTaskbar = NULL;
 
 void EvaluateVisibility(HWND hwnd); // fwd decl
 
+#ifndef DWMWA_CLOAKED
+#define DWMWA_CLOAKED 14
+#endif
+
+// True when w is a real application window sized exactly to the clock's
+// monitor — what a fullscreen game, video player or F11 browser looks like.
+// Exact equality on purpose: a maximised window overhangs the monitor by its
+// resize border, so "covers" would hide the clock behind every maximised window.
+bool CoversClockMonitor(HWND w) {
+    if (!w || w == g_hwndMain) return false;
+    RECT rc;
+    if (!GetWindowRect(w, &rc) || !EqualRect(&rc, &g_mon)) return false;
+    TCHAR cls[64];
+    if (!GetClassName(w, cls, 64)) return false;
+    // The desktop and the taskbar can be monitor-sized without being "fullscreen"
+    return _tcscmp(cls, _T("Progman")) != 0 && _tcscmp(cls, _T("WorkerW")) != 0 &&
+           _tcscmp(cls, _T("Shell_TrayWnd")) != 0 && _tcscmp(cls, _T("Shell_SecondaryTrayWnd")) != 0;
+}
+
+// Finds the top-most real window over the centre of the clock's monitor and
+// asks whether it is fullscreen there. Needed because the foreground window
+// may be on another monitor while a fullscreen video plays on ours.
+// Walks z-order with plain rect tests rather than WindowFromPoint, which sends
+// WM_NCHITTEST across processes and could stall on a hung app.
+bool TopWindowCoversClockMonitor() {
+    POINT c = { (g_mon.left + g_mon.right) / 2, (g_mon.top + g_mon.bottom) / 2 };
+    for (HWND w = GetTopWindow(NULL); w; w = GetWindow(w, GW_HWNDNEXT)) {
+        if (w == g_hwndMain || !IsWindowVisible(w) || IsIconic(w)) continue;
+        // Overlays (game bars, GPU overlays, click-through widgets like this
+        // clock) can be monitor-sized but are never "the app in fullscreen".
+        LONG ex = GetWindowLong(w, GWL_EXSTYLE);
+        if (ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) continue;
+        if ((ex & WS_EX_LAYERED) && (ex & WS_EX_TRANSPARENT)) continue;
+        // Suspended UWP apps keep WS_VISIBLE but are cloaked (not drawn)
+        BOOL cloaked = FALSE;
+        if (SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
+            continue;
+        RECT rc;
+        if (!GetWindowRect(w, &rc) || !PtInRect(&rc, c)) continue;
+        return CoversClockMonitor(w); // The first real window there decides
+    }
+    return false;
+}
+
+// True when a taskbar at rcTray overlaps the clock's visible position.
+// The bar's rect is shrunk by the threshold first: an auto-hidden bar leaves a
+// 1-2 px sliver on screen, which must not count as raised. This one overlap
+// test covers every edge the bar can be docked to (a raised right-hand bar
+// over a right-corner clock used to be ignored), and an always-visible bar
+// never overlaps because the clock is anchored to the work area beside it.
+bool TrayCoversClock(RECT rcTray) {
+    int thr = Config::taskbarThreshold;
+    InflateRect(&rcTray, -thr, -thr);
+    RECT rcClock = { ClockX(), targetY, ClockX() + clockSize.cx, targetY + clockSize.cy };
+    // Only the on-screen part counts: a negative offset pushes the window past
+    // the monitor edge, and that invisible strip used to "touch" the
+    // auto-hidden sliver and keep the clock hidden for good.
+    RECT rcOnScreen, rcHit;
+    if (!IntersectRect(&rcOnScreen, &rcClock, &g_mon)) return false;
+    return IntersectRect(&rcHit, &rcTray, &rcOnScreen) != FALSE;
+}
+
 // Picks the safety-net interval: snappy when the cursor is near the clock,
 // relaxed otherwise, and slowest of all while the clock is already hidden.
 void ArmLogicTimer(HWND hwnd) {
@@ -2070,62 +2330,54 @@ void EvaluateVisibility(HWND hwnd) {
                 }
             }
 
-            if (ok) {
-                bool horizontal = (rcTray.right - rcTray.left) > (rcTray.bottom - rcTray.top);
-                if (horizontal) {
-                    int thr = Config::taskbarThreshold;
-                    if (ClockAtBottom()) {
-                        bool onOurEdge = rcTray.bottom >= g_mon.bottom - thr;
-                        if (onOurEdge && rcTray.top < g_mon.bottom - thr) shouldHide = true;
-                    } else {
-                        bool onOurEdge = rcTray.top <= g_mon.top + thr;
-                        if (onOurEdge && rcTray.bottom > g_mon.top + thr) shouldHide = true;
-                    }
-                }
-            }
+            if (ok && TrayCoversClock(rcTray)) shouldHide = true;
         }
 
-        // Fullscreen / presentation detection via the shell (robust for
-        // D3D games, F11 fullscreen, presentation mode). This is a
-        // cross-process call, so it only runs when the foreground window
-        // changed or every 5th tick (~1.5s) to catch in-place F11 toggles.
+        // Fullscreen detection. Everything here is scoped to the clock's own
+        // monitor: a fullscreen video on another display has nothing to hide
+        // from, and the global shell state used to hide the clock everywhere.
+        //
+        // The expensive parts (the shell query is cross-process, the z-order
+        // walk touches every top-level window) run only when the foreground
+        // window changed or every 5th tick, to catch in-place F11 toggles.
         if (!shouldHide) {
             static HWND s_lastFore = NULL;
-            static int s_qunsTick = 0;
-            static bool s_qunsHide = false;
+            static int s_slowTick = 0;
+            static bool s_slowHide = false;
 
             HWND hFore = GetForegroundWindow();
-            if (hFore != s_lastFore || ++s_qunsTick >= 5) {
+            if (hFore != s_lastFore || ++s_slowTick >= 5) {
                 s_lastFore = hFore;
-                s_qunsTick = 0;
-                s_qunsHide = false;
+                s_slowTick = 0;
+                s_slowHide = false;
+
                 QUERY_USER_NOTIFICATION_STATE quns;
                 if (SUCCEEDED(SHQueryUserNotificationState(&quns))) {
-                    s_qunsHide = (quns == QUNS_RUNNING_D3D_FULL_SCREEN ||
-                                  quns == QUNS_PRESENTATION_MODE ||
-                                  quns == QUNS_BUSY);
+                    if (quns == QUNS_PRESENTATION_MODE) {
+                        s_slowHide = true; // A deliberate, system-wide setting
+                    } else if (quns == QUNS_RUNNING_D3D_FULL_SCREEN) {
+                        // Global state: only ours if the app doing it has
+                        // focus on our monitor (exclusive-mode games may not
+                        // have a window rect that matches the monitor).
+                        // Not QUNS_BUSY: Windows keeps reporting it while a
+                        // fullscreen game sits MINIMISED (measured with
+                        // Roblox), which hid the clock after alt-tabbing out.
+                        // A real borderless-fullscreen window is caught by
+                        // the rect checks below and per tick, so BUSY only
+                        // ever added false hides.
+                        s_slowHide = !g_hMonClock || (hFore &&
+                            MonitorFromWindow(hFore, MONITOR_DEFAULTTONULL) == g_hMonClock);
+                    }
                 }
+                // Fullscreen on our monitor while focus is on another one
+                // (watching a video while working next to it).
+                if (!s_slowHide) s_slowHide = TopWindowCoversClockMonitor();
             }
-            if (s_qunsHide) shouldHide = true;
+            if (s_slowHide) shouldHide = true;
         }
 
-        // Fallback: foreground window exactly covering its own monitor
-        if (!shouldHide) {
-            HWND hFore = GetForegroundWindow();
-            if (hFore) {
-                RECT rc;
-                GetWindowRect(hFore, &rc);
-                HMONITOR hMon = MonitorFromWindow(hFore, MONITOR_DEFAULTTONEAREST);
-                MONITORINFO mi = { sizeof(mi) };
-                if (GetMonitorInfo(hMon, &mi) && EqualRect(&rc, &mi.rcMonitor)) {
-                     TCHAR cName[256];
-                     GetClassName(hFore, cName, 256);
-                     if (_tcscmp(cName, _T("Progman")) != 0 && _tcscmp(cName, _T("WorkerW")) != 0 && _tcscmp(cName, _T("Shell_TrayWnd")) != 0) {
-                         shouldHide = true;
-                     }
-                }
-            }
-        }
+        // Cheap per-tick check: the foreground window exactly covers our monitor
+        if (!shouldHide && CoversClockMonitor(GetForegroundWindow())) shouldHide = true;
 
         // Perform logic check (should we hide?)
         if (shouldHide) {
@@ -2250,6 +2502,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             }
             return 0;
         }
+        if (g_uiBusy) { // Import/Export dialog or its message box is up
+            if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
+                HWND hPop = GetLastActivePopup(hwnd);
+                if (hPop && hPop != hwnd) SetForegroundWindow(hPop);
+            }
+            return 0;
+        }
         if (lParam == WM_RBUTTONUP) {
             ShowContextMenu(hwnd);
         } else if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
@@ -2296,19 +2555,34 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 Config::language = (wmId == ID_LANG_AUTO) ? 0 : (wmId == ID_LANG_EN) ? 1 : 2;
                 ApplyLanguage();
                 SaveConfig();
+                // Day/month names may have changed language with it
+                if (RefreshClockText(hwnd)) AssertTopmost(hwnd);
                 break;
+            // The file dialogs and message boxes below pump messages, so tray
+            // clicks still arrive while they are up. g_uiBusy stops those from
+            // opening Settings over an import: Settings would snapshot the
+            // pre-import config, and Cancel would then restore it in memory
+            // while the registry kept the imported values.
             case ID_MENU_EXPORT:
+                g_uiBusy = true;
                 if (!ExportSettings(hwnd))
                     MessageBox(hwnd, L(S_EXPORT_FAIL), L(S_TITLE), MB_OK | MB_ICONWARNING);
+                g_uiBusy = false;
                 break;
             case ID_MENU_IMPORT:
-                if (ImportSettings(hwnd)) {
-                    UpdateScreenMetrics();
-                    RecalculateAll(hwnd);
-                    MessageBox(hwnd, L(S_IMPORT_OK), L(S_TITLE), MB_OK | MB_ICONINFORMATION);
-                } else {
-                    MessageBox(hwnd, L(S_IMPORT_FAIL), L(S_TITLE), MB_OK | MB_ICONWARNING);
+                g_uiBusy = true;
+                switch (ImportSettings(hwnd)) {
+                    case 1:
+                        UpdateScreenMetrics();
+                        RecalculateAll(hwnd);
+                        MessageBox(hwnd, L(S_IMPORT_OK), L(S_TITLE), MB_OK | MB_ICONINFORMATION);
+                        break;
+                    case 0:
+                        MessageBox(hwnd, L(S_IMPORT_FAIL), L(S_TITLE), MB_OK | MB_ICONWARNING);
+                        break;
+                    default: break; // Cancelled
                 }
+                g_uiBusy = false;
                 break;
         }
         return 0;
@@ -2431,6 +2705,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_DESTROY:
         RemoveVisibilityHooks();
         RemoveTrayIcon();
+        DestroyTrayIconImage();
         FreeSurface();
         FreeFontCache();
         if (g_gdiplusUp) { GdiplusShutdown(gdiplusToken); g_gdiplusUp = false; }

@@ -10,13 +10,14 @@ EdgeClock blends seamlessly into your desktop environment, providing time withou
 
 * **Edge-Clinging Design**: Snaps perfectly to the bottom-right of your screen, blending into your current workflow.
 * **Multi-Monitor Aware**: Automatically follows the monitor hosting your taskbar.
-* **Smart Auto-Hide**: Slides out of view on hover, when the taskbar is raised (bottom-taskbar aware), or when fullscreen apps run — detected reliably via the Windows shell (D3D games, F11 fullscreen, presentation mode).
+* **Smart Auto-Hide**: Slides out of view on hover, when a raised taskbar would cover it (any edge), or when an app goes fullscreen **on the clock's own monitor** — a fullscreen video on another display leaves it alone. Detected via the Windows shell (D3D games, F11 fullscreen, presentation mode) plus a check of the window actually covering that monitor.
+* **Works With Any Taskbar**: With auto-hide the clock sits at the very edge; with an always-visible taskbar it sits right beside it instead of being hidden behind it.
 * **Custom Time Format**: Pick a preset (24-hour, 12-hour, with seconds, with date) or write any `strftime` pattern yourself.
 * **Text Effects**: Outline, Soft Shadow, Glow, or a translucent Pill plate — with adjustable strength.
 * **Any Corner, Any Monitor**: Place the clock in any of the four corners, on the monitor of your choice.
 * **Opacity Control**: Blend the clock into your wallpaper at 20–100% opacity, with a fade on every slide.
 * **Live Preview**: Every setting applies instantly as you change it; Cancel restores everything.
-* **English / ไทย**: The interface follows your Windows language, or you can pick one from the tray menu.
+* **English / ไทย**: The interface follows your Windows language, or you can pick one from the tray menu. In Thai, day and month names in the clock (`%a`, `%b`, date presets) are Thai too.
 * **Portable Settings**: Export and import your configuration from the tray menu.
 * **Extreme Efficiency**:
   * Integrates with Windows EcoQoS to minimize CPU impact and battery drain.

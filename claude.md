@@ -87,17 +87,24 @@ would drop unless rendering at 4× and downsampling — which spends back the CP
 and memory saved. Soft Shadow/Glow would need reimplementing with `ExtCreatePen`.
 
 ### Checks before a release
-Run `check.bat`. It is free, deterministic and offline — three stages:
+Run `check.bat` (`check.bat --no-pause` when scripted; `build.bat` takes the
+same switch). It is free, deterministic and offline — four stages:
 1. `-Wall -Wextra` syntax pass
 2. stricter pass: `-Wshadow -Wformat=2 -Wnull-dereference -Wcast-align` at `-O2`
    (`-Wnull-dereference` needs optimisation to see the data flow)
 3. GDI/handle pairing audit (`GetDC`/`ReleaseDC`, `CreateCompatibleDC`/`DeleteDC`,
    `CreatePopupMenu`/`DestroyMenu` — the last may legitimately differ because
    `DestroyMenu` recursively frees attached submenus)
+4. `tests/selftest.cpp` — `#include`s the real `EdgeClock.cpp` and asserts the
+   logic that has regressed before: work-area placement, taskbar overlap,
+   time-format validation, Thai day names, clamping. Add a case when touching
+   any of these.
 
 Notes: `g++ -fanalyzer` is a no-op here — GCC's static analyzer only supports C,
 not C++. `cppcheck`/`clang-tidy` are not installed on this machine; if added they
-would slot into `check.bat` as a fourth stage.
+would slot into `check.bat` as a fifth stage. Keep both `.bat` files pure ASCII
+with CRLF endings: a UTF-8 em dash in a `REM` line once made `cmd` print
+`'M' is not recognized`.
 
 ### Linked Libraries
 `gdi32`, `user32`, `gdiplus`, `comdlg32`, `ole32`, `uuid`, `dwmapi`, `comctl32` — all statically linked.
@@ -110,7 +117,9 @@ would slot into `check.bat` as a fourth stage.
 | `EdgeClock.exe.manifest` | Application manifest for Common Controls v6 |
 | `EdgeClock.iss` | Inno Setup installer script |
 | `build.bat` | One-click build script |
-| `clock_23989.ico` | Application icon |
+| `check.bat` | Pre-release checks (4 stages, see above) |
+| `tests/selftest.cpp` | Offline logic self-test, run by `check.bat` |
+| `clock_23989.ico` | Application icon — 16/20/24/32/40/48/64/128 px, so the tray gets an exact size at every DPI |
 
 ## Important Patterns
 - **Layered Window**: Uses `WS_EX_LAYERED | WS_EX_TRANSPARENT` for click-through transparent overlay
@@ -218,3 +227,61 @@ pre-sleep ticks — the sibling of the existing `WM_TIMECHANGE` handler.
 **Deliberately not done**: unhooking the WinEvent hooks while manually hidden.
 `EvaluateVisibility` early-returns in two compares in that state, so the saving
 is noise, and it adds a way for the clock to never come back.
+
+## Review fixes (2026-11-22, unreleased — version still 1.7.1)
+**Placement is anchored to the work area** (`g_work`), not the monitor rect.
+Identical with an auto-hide taskbar (verified: work area == monitor here). With
+an always-visible taskbar the clock now sits beside it; before, the bar counted
+as "raised" forever and a bottom-corner clock never appeared.
+
+**Taskbar hide is one overlap test** (`TrayCoversClock`): the bar's rect,
+shrunk by `taskbarThreshold` so the auto-hidden 1-2 px sliver does not count,
+intersected with the clock's visible rect. Covers every docking edge — a raised
+right-hand bar over a right-corner clock used to be ignored.
+
+**Fullscreen is scoped to the clock's monitor.** `CoversClockMonitor` (exact
+`EqualRect` with `g_mon` — "contains" would match every maximised window, which
+overhangs by its border) runs per tick on the foreground window. The throttled
+slot (foreground change / every 5th tick) adds `SHQueryUserNotificationState`
+— D3D only counts if the foreground window is on our monitor; presentation
+mode stays global; `QUNS_BUSY` is ignored (measured: Windows keeps reporting
+it while a fullscreen game sits minimised, so the clock stayed hidden after
+alt-tabbing out; the rect checks catch real borderless fullscreen) — and `TopWindowCoversClockMonitor`, a z-order walk for a
+fullscreen window on our monitor while focus is elsewhere. It uses rect tests,
+not `WindowFromPoint` (which sends `WM_NCHITTEST` cross-process and can stall
+on a hung app), and skips tool/no-activate/click-through/cloaked windows so
+overlays never count. Measured: no CPU change at the 15.6 ms resolution.
+
+**Settings dialog**: created on the cursor's monitor (DPI is read in
+`WM_CREATE`, so `CW_USEDEFAULT` on the primary gave the wrong scale) and
+hidden until laid out; handles `WM_DPICHANGED` by rescaling every child by
+new/old (combos use their list height) and resizing via
+`AdjustWindowRectExForDpi`. Custom format box: `EM_LIMITTEXT 31`, red when
+invalid (`g_fmtInvalid`). Font picker: no `CF_EFFECTS` (its options were
+ignored); its Bold/Italic now sets the Weight combo. Monitor combo entries
+carry the monitor number as item data, so an unplugged saved monitor is listed
+as "(not connected)" instead of silently becoming Auto on Save.
+
+**Other**: tray icon via `LoadImage` at `SM_CXSMICON` (not `LoadIconMetric`:
+static-linking it stops the exe loading without comctl32 v6 — measured
+`STATUS_ENTRYPOINT_NOT_FOUND`). Thai mode sets `LC_TIME` to
+`Thai_Thailand.874` (msvcrt rejects `th-TH`; English must be `"C"`, it rejects
+`en-US` too) — `LC_NUMERIC` is deliberately untouched so `_wtof` keeps `.`.
+`g_uiBusy` blocks tray clicks while Import/Export dialogs are up. Installer
+removes the Run value on uninstall even when the app (not the installer task)
+created it.
+
+**Found by driving the real UI** (after the review fixes above):
+- `TrayCoversClock` intersects the clock with `g_mon` first. A negative
+  `offsetY` pushes the window past the screen edge, and that invisible strip
+  "touched" the auto-hidden sliver, so the clock never came back. Covered by
+  a self-test case.
+- Arrowing onto "Custom…" in the Format list moved focus into the box and
+  closed the list, so the next Enter hit Save. Focus now moves on
+  `CBN_CLOSEUP` via `SetFocus` (`WM_NEXTDLGCTL` does nothing here: this is a
+  plain window, not a dialog, so there is no dialog manager to handle it).
+- `ImportSettings` returns 1/0/-1; a cancelled picker used to return true and
+  announce "Settings imported."
+- The Settings dialog may open without focus when another app holds the
+  foreground lock (posted command, not a click): Windows refuses
+  `SetForegroundWindow`. Harmless; a tray click is user input and is allowed.

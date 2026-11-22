@@ -1,20 +1,23 @@
 @echo off
 REM ============================================================
-REM  EdgeClock static checks — free, deterministic, no network.
+REM  EdgeClock static checks - free, deterministic, no network.
 REM  Run this before tagging a release. Everything it reports is
 REM  produced by the compiler, so there are no false "opinions".
+REM  Pass --no-pause to run it unattended (CI, scripts).
 REM ============================================================
 setlocal
+set "NOPAUSE="
+if /i "%~1"=="--no-pause" set "NOPAUSE=1"
 
 echo.
-echo [1/3] Full warning set (-Wall -Wextra)
+echo [1/4] Full warning set (-Wall -Wextra)
 echo ------------------------------------------------------------
 g++ -fsyntax-only EdgeClock.cpp ^
     -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 if %errorlevel% neq 0 goto :failed
 
 echo.
-echo [2/3] Stricter pass (shadowing, format strings, null derefs)
+echo [2/4] Stricter pass (shadowing, format strings, null derefs)
 echo ------------------------------------------------------------
 REM -O2 is required for -Wnull-dereference to see through the data flow.
 g++ -c EdgeClock.cpp -o nul -O2 ^
@@ -23,7 +26,7 @@ g++ -c EdgeClock.cpp -o nul -O2 ^
 if %errorlevel% neq 0 goto :failed
 
 echo.
-echo [3/3] GDI/handle pairing audit
+echo [3/4] GDI/handle pairing audit
 echo ------------------------------------------------------------
 echo   Each create must have a matching release. Investigate any
 echo   pair whose counts do not line up.
@@ -36,9 +39,20 @@ echo   (CreatePopupMenu may legitimately exceed DestroyMenu:
 echo    DestroyMenu is recursive and frees attached submenus.)
 
 echo.
+echo [4/4] Self-test (placement, taskbar overlap, formats, locale)
+echo ------------------------------------------------------------
+g++ tests\selftest.cpp -o "%TEMP%\ec_selftest.exe" -mconsole ^
+    -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers ^
+    -lgdi32 -luser32 -lgdiplus -lcomdlg32 -lole32 -luuid -ldwmapi -lcomctl32 -luxtheme -static
+if %errorlevel% neq 0 goto :failed
+"%TEMP%\ec_selftest.exe"
+if %errorlevel% neq 0 goto :failed
+del "%TEMP%\ec_selftest.exe" 2>nul
+
+echo.
 echo All checks passed.
+if not defined NOPAUSE pause
 endlocal
-pause
 exit /b 0
 
 :count
@@ -50,6 +64,6 @@ exit /b 0
 :failed
 echo.
 echo CHECKS FAILED - see the output above.
+if not defined NOPAUSE pause
 endlocal
-pause
 exit /b 1
