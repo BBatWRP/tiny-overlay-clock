@@ -15,7 +15,8 @@ Line numbers drift with every change — search for the name instead.
 | `ClampConfig` | Repairs out-of-range / NaN values; used by load, import and the Settings dialog |
 | `SaveConfig` / `LoadConfig` | Persist settings to `HKCU\Software\EdgeClock` (typed `RegGetValue` reads) |
 | `IsStartupEnabled` / `SetStartup` | Manage "Run on Startup" via `HKCU\...\Run` registry key |
-| `BuildClockPath` / `RenderClock` / `PresentClock` | Glyph path once per update → cached DIB → `UpdateLayeredWindow` |
+| `BuildClockPath` / `RenderClock` / `UploadClock` / `PresentClock` | Glyph path once per update → DIB → one content upload; frames move/fade with `hdcSrc = NULL` |
+| `HookTray` / `PauseTrayHook` / `ResumeTrayHookIfIdle` | Taskbar `LOCATIONCHANGE` hook, lifted while the pointer moves over the bar |
 | `RecalculateAll` / `RefreshClockText` | The only draw path, and the only correct way to request one |
 | `ShowContextMenu` | System tray right-click menu |
 | `SettingsWndProc` / `DoSettingsDialog` | Dark-themed modal settings dialog with live preview |
@@ -32,7 +33,10 @@ Line numbers drift with every change — search for the name instead.
   second/minute boundary rather than polled, and **killed outright while
   hidden** — nothing is on screen to keep current, so the redraw happens on the
   way back in instead (`StartSlide` → `RefreshClockText`).
-- **Timer 3** (16ms, `Config::refreshRate`): animation tick — smooth slide up/down.
+- **Timer 3** (16ms, `Config::refreshRate`): animation tick. USER timers round up
+  to the 15.6 ms tick, and under IDLE + EcoQoS SetTimer(16) measured 28-29 ms
+  (~35 fps, ~8 frames per 200 ms slide). 15 would give ~60 fps for twice the
+  frame wakeups; left at 16 on purpose.
 - **Timer 4** (100ms, only during exit): `RequestQuit` retry while a modal is
   being closed. Never armed otherwise.
 
@@ -41,11 +45,12 @@ While manually hidden all three timers are off: the process sleeps in
 
 ### The one rule for the clock text
 `RecalculateAll` is the only function that draws, so it is the only function
-that writes `g_lastRendered` — the string currently on screen. Do not keep a
-second "last time I saw" copy at a call site; that is what the pre-v1.7 code did
-and the two drifted. `RefreshClockText()` is the only correct way to ask for an
-update: it renders when the string changed **or** when the surface is gone, and
-is a no-op otherwise.
+that writes `g_lastRendered` — the string in the bitmap the window holds. Do not
+keep a second "last time I saw" copy at a call site; that is what the pre-v1.7
+code did and the two drifted. `RefreshClockText()` is the only correct way to ask
+for an update: it renders when the string changed **or** nothing valid was ever
+uploaded, and is a no-op otherwise. The window keeps its bitmap while parked
+hidden, so a hide/show in the same minute costs no render.
 
 ### Configuration Storage
 All settings stored in Windows Registry at `HKEY_CURRENT_USER\Software\EdgeClock`. Startup auto-run registered at `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`.
@@ -53,9 +58,9 @@ All settings stored in Windows Registry at `HKEY_CURRENT_USER\Software\EdgeClock
 ## Build
 ```bat
 windres EdgeClock.rc -o resource.o
-g++ -o EdgeClock.exe EdgeClock.cpp resource.o -lgdi32 -luser32 -lgdiplus -lcomdlg32 -lole32 -luuid -mwindows -ldwmapi -lcomctl32 -static
+g++ -o EdgeClock.exe EdgeClock.cpp resource.o -Os -fno-exceptions -fno-rtti -ffunction-sections -fdata-sections -Wl,--gc-sections -s -lgdi32 -luser32 -lgdiplus -lcomdlg32 -lole32 -luuid -mwindows -ldwmapi -lcomctl32 -luxtheme -static
 ```
-Or run `build.bat`. Requires MinGW with `g++` and `windres`.
+Or run `build.bat` (the line above without its warning flags). Requires MinGW with `g++` and `windres`.
 
 `build.bat` compiles with `-Wall -Wextra` and the tree is warning-clean, so any
 warning that appears is new and worth reading.
@@ -68,6 +73,18 @@ warning that appears is new and worth reading.
 | `-ffunction-sections -fdata-sections -Wl,--gc-sections -s` | Discards unreferenced code and symbols. |
 
 Exe size across the three steps: **688 KB → 270 KB → 166 KB** (−76%).
+v1.7.3 measured 123,392 bytes; v1.8 is 92,672 (printf engine removed, see below).
+
+**printf family: msvcrt forms only.** libstdc++'s `os_defines.h` forces
+`__USE_MINGW_ANSI_STDIO=1` (`-D...=0` is a no-op), which routes `fprintf` and the
+C++ `swprintf`/`_stprintf` overloads to MinGW's own formatter (pformat + gdtoa):
+~36 KB, 29% of the exe. Use `FormatTo` (wide) or `_snprintf` (narrow).
+`check.bat` fails the build if `__mingw_pformat`/`__gdtoa` get linked back in.
+msvcrt rounds exact halves up (`%.1f` of 0.25 → "0.3").
+
+**Measured, no gain:** `-Oz` −1 KB, `-flto` 0, `-fno-ident`/`-fmerge-all-constants`/
+`--build-id=none` 0. Dropping unwind tables saves 1 KB but loses x64 stack walking
+for crash dumps — rejected. GNU ld has no `--icf`.
 
 ### Memory strategy (measured, do not "optimise" further without re-measuring)
 `SetProcessWorkingSetSize(-1, -1)` runs immediately after every render (inside
@@ -75,6 +92,26 @@ Exe size across the three steps: **688 KB → 270 KB → 166 KB** (−76%).
 most once a minute, the pages it returns are only faulted back once a minute.
 Exception: formats that show seconds (`FormatHasSeconds`: `%S`, `%X`, `%c`)
 render every second, so they skip the per-render trim and only trim on park.
+
+**The price of the per-render trim (re-measured v1.8, kept anyway):** a redraw
+right after a trim costs ~4.2 Mcycles and ~500 soft faults; without the trim it
+is ~1.5 Mcycles and ~1 fault, but the working set settles at ~2.0–2.4 MB instead
+of < 1 MB. That is ~2.7 Mcycles/min, roughly 5–10% of idle-visible CPU. The
+sub-1 MB target was kept deliberately; this is the number to weigh if it changes.
+
+**Where the CPU actually goes (measured v1.8 with a WH_GETMESSAGE probe):**
+idle-visible, the only wakeup is timer 1 (2/s). Each tick costs ~3 context
+switches, of which ~2 are the platform floor for any timer wakeup on this
+machine; the clock's own per-tick work is a few µs. Active use dominates:
+slides, hide/show cycles and pointer motion over the taskbar (see v1.8).
+
+**Untried, measured opportunity:** `new FontFamily(name)` makes GDI+ enumerate
+every installed font (~1,100 here): ~85 ms warm / ~1.1 s cold at startup and
+~1.4 MB commit that is never released. A `PrivateFontCollection` with only the
+configured face file costs ~5–10 ms and ~0.5 MB. Glyph fallback still works (GDI+
+builds the full table then, same cost as today). Needs name+weight → file
+resolution (DirectWrite GDI interop) and must keep `FontStyleFor`'s style
+fallback — about 60 lines; not done yet.
 
 **Rejected after measurement:** shutting GDI+ down between renders
 (`GdiplusShutdown` + restart per minute). It saved only ~90 KB — the trim already
@@ -97,6 +134,8 @@ same switch). It is free, deterministic and offline — four stages:
 3. GDI/handle pairing audit (`GetDC`/`ReleaseDC`, `CreateCompatibleDC`/`DeleteDC`,
    `CreatePopupMenu`/`DestroyMenu` — the last may legitimately differ because
    `DestroyMenu` recursively frees attached submenus)
+   …plus the printf-engine guard (builds with `build.bat`'s flags — without
+   `--gc-sections` unused inline wrappers stay linked — and greps `nm`).
 4. `tests/selftest.cpp` — `#include`s the real `EdgeClock.cpp` and asserts the
    logic that has regressed before: work-area placement, taskbar overlap,
    time-format validation, Thai day names, clamping. Add a case when touching
@@ -109,7 +148,7 @@ with CRLF endings: a UTF-8 em dash in a `REM` line once made `cmd` print
 `'M' is not recognized`.
 
 ### Linked Libraries
-`gdi32`, `user32`, `gdiplus`, `comdlg32`, `ole32`, `uuid`, `dwmapi`, `comctl32` — all statically linked.
+`gdi32`, `user32`, `gdiplus`, `comdlg32`, `ole32`, `uuid`, `dwmapi`, `comctl32`, `uxtheme` — all statically linked; each is actually used.
 
 ## Key Files
 | File | Purpose |
@@ -121,7 +160,7 @@ with CRLF endings: a UTF-8 em dash in a `REM` line once made `cmd` print
 | `build.bat` | One-click build script |
 | `check.bat` | Pre-release checks (4 stages, see above) |
 | `tests/selftest.cpp` | Offline logic self-test, run by `check.bat` |
-| `clock_23989.ico` | Application icon — 16/20/24/32/40/48/64/128 px, so the tray gets an exact size at every DPI |
+| `clock_23989.ico` | Application icon — 16/20/24/32/40/48/64/128 px, so the tray gets an exact size at every DPI. 16–32 px are uncompressed 32bpp DIB (AND mask from alpha), 40+ PNG: user32 decodes PNG frames through WIC, which loaded IconCodecService + WindowsCodecs for the life of the process (~170 KB). Keep the small frames DIB. |
 
 ## Important Patterns
 - **Layered Window**: Uses `WS_EX_LAYERED | WS_EX_TRANSPARENT` for click-through transparent overlay
@@ -217,10 +256,10 @@ maximum, so this scales with font size. The boundary guard also went 20 ms → 3
 (past the ~15.6 ms timer granularity) so an early fire no longer costs a
 re-arm tick.
 
-**Ordering that matters**: the park cleanup (`FreeSurface`) runs *after* the
-final `PresentClock` of the slide-down. Freeing first makes that call a no-op
-(`PresentClock` bails on a null surface) and strands the clock one frame short
-of hidden.
+**Ordering that mattered** (obsolete since v1.8, where frames never read the
+DIB): the park cleanup (`FreeSurface`) had to run *after* the final
+`PresentClock` of the slide-down, or that call was a no-op and stranded the
+clock one frame short of hidden.
 
 **Also**: `WM_POWERBROADCAST` (`PBT_APMRESUMEAUTOMATIC`/`PBT_APMRESUMESUSPEND`)
 corrects the text on resume instead of waiting for a timer armed against
@@ -322,3 +361,46 @@ removed); reinstall. No crash/hang events. Note for scripted tests:
 `Start-Process -Wait` also waits for the relaunched clock (a child), so use
 `$p.WaitForExit()`; and PowerShell passes `$null` to a `string` P/Invoke
 parameter as `""`, so `FindWindowW(class, $null)` never matches a titled window.
+
+## v1.8 — measured performance pass (2026-11-24)
+Found by probing the live clock (WH_GETMESSAGE/WH_CALLWNDPROC counting hook,
+per-thread context switches, QueryProcessCycleTime) and a harness that
+`#include`s the real `EdgeClock.cpp` and drives its render/park paths on a
+private off-screen window. Idle-visible was already at the floor; active use
+was not.
+
+**Show after a park no longer re-renders.** The park cleanup freed the DIB and
+cleared `g_lastRendered`, so every show after a hide longer than the 200 ms
+slide (every taskbar raise, every hover) did a full cold GDI+ render right after
+the park trim: 4.6-7.6 Mcycles, ~525 faults. The window keeps its own bitmap, so
+now: `UploadClock` sends content once per render, `PresentClock` moves/fades
+with `hdcSrc = NULL` (MSDN: allowed when shape and content do not change;
+~20% cheaper per frame), and parking frees the DIB but keeps `g_lastRendered`.
+Show with the same text: **0.4-0.5 Mcycles, ~38 faults**. Live hover cycle:
+**~47 -> ~16 Mcycles, ~805 -> ~217 faults**. The DIB stays cached while
+visible: freeing it after every upload made each redraw 6-22% dearer.
+
+**Cursor-event flood over the taskbar.** The tray-thread `LOCATIONCHANGE` hook
+also gets `OBJID_CURSOR` for every pointer move over a taskbar window (cursor
+events belong to the thread under the pointer; no hook filter excludes them).
+Measured: 60-125 moves/s cost **5.5-12 Mcycles/s, 10-25x idle**. The first
+cursor event now unhooks (`PauseTrayHook`), timer 1 runs at 120 ms meanwhile
+and watches the bar, and `ResumeTrayHookIfIdle` re-hooks once the pointer is at
+rest between two ticks. Live: **flat ~2.0-2.4 Mcycles/s at any rate**, 35-41
+instead of 175-367 context switches/s. Moving the pointer elsewhere on screen
+never produced cursor events (verified).
+
+**Slow-path throttle by time.** The every-5th-evaluation
+`SHQueryUserNotificationState` (54 us + 1.5 context switches) also counted
+120 ms ticks and taskbar event bursts, so it ran every 600 ms near the clock. Now 5th call AND >= 2.5 s.
+
+**Exe 123,392 -> 92,672 bytes** (printf engine removed; the icon adds 4.6 KB),
+**WIC no longer loaded** (icon small frames as DIB). Private bytes of a fresh
+start 4.7-5.2 MB -> 4.36 MB.
+
+**Checked and rejected:** SetCoalescableTimer on timer 1 (no fewer wakeups);
+ABN_FULLSCREENAPP appbar instead of SHQUNS (same signal as the rect checks,
+spurious on desktop focus, needs ABM_REMOVE on every exit); ImmDisableIME (IME
+risk in the Settings edit box for ~0 KB resident); SuppressBackgroundThread on
+GDI+ (0 switches measured); delay-loading comdlg32 (~0.1 MB, needs a dlltool
+step). Leaks: none; handles/GDI/USER flat over 4.8 h uptime.

@@ -39,6 +39,25 @@ echo   (CreatePopupMenu may legitimately exceed DestroyMenu:
 echo    DestroyMenu is recursive and frees attached submenus.)
 
 echo.
+echo   printf engine: libstdc++ forces __USE_MINGW_ANSI_STDIO=1, so any
+echo   fprintf / swprintf / _stprintf call links MinGW's own formatter
+echo   (~36 KB, a third of the exe). Use FormatTo / _snprintf instead.
+echo   (Same flags as build.bat: without --gc-sections the unused inline
+echo    wrappers stay linked and this would always fail.)
+g++ EdgeClock.cpp -o "%TEMP%\ec_symcheck.exe" -Os -mwindows ^
+    -fno-exceptions -fno-rtti -ffunction-sections -fdata-sections -Wl,--gc-sections ^
+    -lgdi32 -luser32 -lgdiplus -lcomdlg32 -lole32 -luuid -ldwmapi -lcomctl32 -luxtheme -static
+if %errorlevel% neq 0 goto :failed
+nm "%TEMP%\ec_symcheck.exe" | findstr /i "mingw_pformat gdtoa" >nul
+if %errorlevel% equ 0 (
+    del "%TEMP%\ec_symcheck.exe" 2>nul
+    echo   FAIL: MinGW printf engine is linked in.
+    goto :failed
+)
+del "%TEMP%\ec_symcheck.exe" 2>nul
+echo   OK: not linked.
+
+echo.
 echo [4/4] Self-test (placement, taskbar overlap, formats, locale)
 echo ------------------------------------------------------------
 g++ tests\selftest.cpp -o "%TEMP%\ec_selftest.exe" -mconsole ^

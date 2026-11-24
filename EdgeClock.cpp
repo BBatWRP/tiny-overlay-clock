@@ -33,6 +33,22 @@ using namespace Gdiplus;
 // =============================================================
 static HANDLE g_hMutex = NULL; // Global mutex for single-instance
 
+// --- printf family: msvcrt forms only ---------------------------------------
+// libstdc++'s os_defines.h forces __USE_MINGW_ANSI_STDIO=1 (so -D...=0 is a
+// no-op). That turns fprintf and the C++ swprintf/_stprintf overloads into
+// MinGW's own formatter (pformat + gdtoa): ~36 KB, 29% of the exe, for a
+// handful of "%.1f" calls. The underscore forms (_snwprintf, _vsnwprintf,
+// _snprintf) are Microsoft's and go straight to msvcrt.dll. Use FormatTo for
+// wide text and _snprintf for narrow; check.bat fails if pformat comes back.
+// Note: msvcrt rounds exact halves up ("%.1f" of 0.25 -> "0.3", gdtoa: "0.2").
+template <size_t N> static void FormatTo(WCHAR (&buf)[N], const WCHAR* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnwprintf(buf, N - 1, fmt, ap); // Does not terminate on truncation...
+    va_end(ap);
+    buf[N - 1] = L'\0';               // ...so always do it here
+}
+
 // Appends a timestamped line to %LOCALAPPDATA%\EdgeClock\EdgeClock_Log.txt.
 // Not next to the exe: an installed copy lives in Program Files, which a
 // normal user cannot write, so logging there silently did nothing. The file is
@@ -72,8 +88,11 @@ void Log(const char* msg) {
     if (f) {
         SYSTEMTIME st;
         GetLocalTime(&st);
-        fprintf(f, "%04u-%02u-%02u %02u:%02u:%02u  %s\n", st.wYear, st.wMonth, st.wDay,
-                st.wHour, st.wMinute, st.wSecond, msg);
+        char line[600]; // _snprintf, not fprintf: see FormatTo above
+        _snprintf(line, sizeof(line) - 1, "%04u-%02u-%02u %02u:%02u:%02u  %s\n", st.wYear,
+                  st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, msg);
+        line[sizeof(line) - 1] = '\0';
+        fputs(line, f);
         fclose(f);
     }
 }
@@ -618,9 +637,13 @@ bool BuildClockPath(GraphicsPath& path, RectF& bounds, TCHAR* textOut, int textC
     return bounds.Width > 0.0f && bounds.Height > 0.0f;
 }
 
-// --- Cached layered-window surface ------------------------------------------
-// The rendered text lives in a 32bpp DIB. Sliding and fading only re-present
-// this surface (a single UpdateLayeredWindow), so animation costs no GDI+ work.
+// --- Render surface -----------------------------------------------------------
+// The text is rendered into a 32bpp DIB and uploaded to the window
+// (UploadClock), which keeps its own copy of the bitmap. Sliding and fading
+// pass no source surface at all (PresentClock), so animation costs no GDI+ work
+// and no pixel copy. The DIB is kept while visible only so the next render can
+// reuse it (measured: freeing it after every upload made each redraw 6-22%
+// dearer), and freed when the clock parks hidden.
 HDC     g_hdcCache = NULL;
 HBITMAP g_hbmCache = NULL;
 HBITMAP g_hbmOld = NULL;
@@ -665,23 +688,46 @@ bool EnsureSurface(int w, int h) {
     return true;
 }
 
-// Blits the cached surface to the window at (x, y) with the given alpha.
-// Also moves/resizes the window, so no separate SetWindowPos is needed.
-void PresentClock(HWND hwnd, int x, int y, int alphaPercent) {
-    if (!g_hdcCache || g_cacheW <= 0 || g_cacheH <= 0) return;
+// True once the window holds a bitmap. The window keeps that bitmap until the
+// next upload, through moves, fades and alpha 0 alike.
+bool g_hasContent = false;
+
+static BLENDFUNCTION ClockBlend(int alphaPercent) {
     if (alphaPercent < 0) alphaPercent = 0;
     if (alphaPercent > 100) alphaPercent = 100;
-
-    POINT ptSrc = { 0, 0 };
-    POINT ptDst = { x, y };
-    SIZE size = { g_cacheW, g_cacheH };
     BLENDFUNCTION blend;
     ZeroMemory(&blend, sizeof(blend));
     blend.BlendOp = AC_SRC_OVER;
     blend.SourceConstantAlpha = (BYTE)(alphaPercent * 255 / 100);
     blend.AlphaFormat = AC_SRC_ALPHA;
+    return blend;
+}
 
-    UpdateLayeredWindow(hwnd, NULL, &ptDst, &size, g_hdcCache, &ptSrc, 0, &blend, ULW_ALPHA);
+// Hands the freshly rendered surface to the window at (x, y) with the given
+// alpha — content, size, position and blend in one call. Only RecalculateAll
+// uploads; everything else moves or fades what is already there.
+bool UploadClock(HWND hwnd, int x, int y, int alphaPercent) {
+    if (!g_hdcCache || g_cacheW <= 0 || g_cacheH <= 0) return false;
+    POINT ptSrc = { 0, 0 };
+    POINT ptDst = { x, y };
+    SIZE size = { g_cacheW, g_cacheH };
+    BLENDFUNCTION blend = ClockBlend(alphaPercent);
+    if (!UpdateLayeredWindow(hwnd, NULL, &ptDst, &size, g_hdcCache, &ptSrc, 0, &blend, ULW_ALPHA))
+        return false;
+    g_hasContent = true;
+    return true;
+}
+
+// Moves and/or fades the window without touching its bitmap. MSDN: hdcSrc
+// (and with it psize/pptSrc) may be NULL "if the shape and visual context of
+// the window are not changing" — so a frame copies no pixels. Measured ~25%
+// cheaper per frame than re-uploading, and it is what lets the render surface
+// be freed straight after each upload.
+void PresentClock(HWND hwnd, int x, int y, int alphaPercent) {
+    if (!g_hasContent) return; // Nothing uploaded yet
+    POINT ptDst = { x, y };
+    BLENDFUNCTION blend = ClockBlend(alphaPercent);
+    UpdateLayeredWindow(hwnd, NULL, &ptDst, NULL, NULL, NULL, 0, &blend, ULW_ALPHA);
 }
 
 // Adds a rounded rectangle (used by the Pill effect) to a path.
@@ -805,15 +851,15 @@ bool FormatHasSeconds() {
     return false;
 }
 
-// The time string currently painted into the cached surface — i.e. what the
-// user is actually looking at. Owned by RecalculateAll(), the only function
-// that draws, so it can never drift from the pixels the way a caller-side
-// "last time I saw" copy can. Empty means "nothing valid on screen".
+// The time string in the bitmap the window currently holds — i.e. what the
+// user sees whenever the clock is in view. Owned by RecalculateAll(), the only
+// function that draws, so it can never drift from the pixels the way a
+// caller-side "last time I saw" copy can. Empty means "nothing valid uploaded".
 TCHAR g_lastRendered[64] = {0};
 
-// Re-measures the text, resizes the cached surface, redraws it and presents it
-// at the configured corner. This is the only expensive path; animation frames
-// reuse the surface via PresentClock().
+// Re-measures the text, renders it into a transient surface and uploads that to
+// the window at the configured corner. This is the only expensive path;
+// animation frames move/fade the uploaded bitmap via PresentClock().
 void RecalculateAll(HWND hwnd) {
     GdiplusEnsure();
 
@@ -844,24 +890,20 @@ void RecalculateAll(HWND hwnd) {
             int alpha = (currentState == STATE_HIDDEN) ? 0
                       : (currentState == STATE_VISIBLE) ? Config::opacity
                       : Config::opacity * g_animAlpha / 100;
-            PresentClock(hwnd, ClockX(), (int)currentYVal, alpha);
-            shown = true;
+            shown = UploadClock(hwnd, ClockX(), (int)currentYVal, alpha);
         }
 
-        // Only claim a string is on screen once it really was drawn. A failed
-        // build (bad font, empty format) leaves the cache empty so the next
+        // Only claim a string is on screen once it really was uploaded. A
+        // failed build (bad font, empty format) leaves this empty so the next
         // tick retries instead of concluding "nothing changed" for a minute.
         if (shown) _tcscpy(g_lastRendered, drawn);
         else       g_lastRendered[0] = _T('\0');
     } // GDI+ objects destroyed before the working set is trimmed
 
-    // Hidden means the surface is parked off-screen where nobody can see it,
-    // and StartSlide() rebuilds it on the way back in. Holding its DIB for the
-    // whole idle period buys nothing, so give it back before trimming.
-    if (currentState == STATE_HIDDEN) {
-        FreeSurface();
-        g_lastRendered[0] = _T('\0');
-    }
+    // Hidden: nothing will be re-rendered until the clock comes back, so the
+    // DIB buys nothing for the whole idle period. The window keeps the bitmap,
+    // so g_lastRendered stays valid.
+    if (currentState == STATE_HIDDEN) FreeSurface();
 
     // The render just touched GDI+'s heaps and the glyph rasteriser; hand those
     // pages straight back. They are only needed again on the next redraw, at
@@ -878,16 +920,16 @@ void RecalculateAll(HWND hwnd) {
 }
 
 // Brings the on-screen text up to date, doing the expensive render only when it
-// would actually change something. Two things make that check reliable:
-// g_lastRendered is written by the render path itself, and it is empty whenever
-// the surface is gone — so a clock coming back from hidden always redraws.
-// Returns true if a render happened.
+// would actually change something. g_lastRendered is written by the render
+// path itself and is empty unless an upload succeeded, and the window keeps
+// that bitmap while hidden — so a clock coming back in redraws only if the text
+// changed meanwhile. Returns true if a render happened.
 bool RefreshClockText(HWND hwnd) {
     if (currentState == STATE_HIDDEN) return false; // Nothing visible to correct
 
     TCHAR cur[64];
     GetTime(cur, 64);
-    if (g_hdcCache && _tcscmp(g_lastRendered, cur) == 0) return false;
+    if (g_lastRendered[0] && _tcscmp(g_lastRendered, cur) == 0) return false;
 
     RecalculateAll(hwnd);
     return true;
@@ -1526,7 +1568,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             y += GAP;
             // Size + Weight
             LABEL(L(S_SIZE), LX, y, LLW);
-            _stprintf(buf, _T("%.1f"), Config::fontSize);
+            FormatTo(buf, _T("%.1f"), Config::fontSize);
             SetWindowText(EDIT(LCX, y, 52, ID_EDIT_FONT_SIZE), buf);
             LABEL(L(S_WEIGHT), LCX + 58, y, 48);
             HWND hWeight = COMBO(LCX + 108, y, 68, ID_COMBO_WEIGHT);
@@ -1576,7 +1618,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             y += GAP;
             // FX width + FX colour
             LABEL(L(S_FX_WIDTH), LX, y, LLW);
-            _stprintf(buf, _T("%.1f"), Config::outlineWidth);
+            FormatTo(buf, _T("%.1f"), Config::outlineWidth);
             SetWindowText(EDIT(LCX, y, 52, ID_EDIT_OUTLINE_WIDTH), buf);
             LABEL(L(S_FX_COLOR), LCX + 58, y, 48);
             hColorBtn2 = ODBTN(_T(""), LCX + 108, y, 52, H, ID_BTN_OUTLINE_COLOR);
@@ -1587,7 +1629,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             HWND hPow = MK(TRACKBAR_CLASS, _T(""), WS_TABSTOP, LCX - 4, y, 124, 28, ID_TRACK_FXPOWER);
             SendMessage(hPow, TBM_SETRANGE, TRUE, MAKELPARAM(10, 200));
             SendMessage(hPow, TBM_SETPOS, TRUE, Config::fxIntensity);
-            _stprintf(buf, _T("%d%%"), Config::fxIntensity);
+            FormatTo(buf, _T("%d%%"), Config::fxIntensity);
             StyleControl(MK(_T("STATIC"), buf, SS_CENTERIMAGE, LCX + 124, y, 52, H, ID_STATIC_FXPOWER_VAL));
 
             y += GAP;
@@ -1596,7 +1638,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             HWND hOpTrack = MK(TRACKBAR_CLASS, _T(""), WS_TABSTOP, LCX - 4, y, 124, 28, ID_TRACK_OPACITY);
             SendMessage(hOpTrack, TBM_SETRANGE, TRUE, MAKELPARAM(20, 100));
             SendMessage(hOpTrack, TBM_SETPOS, TRUE, Config::opacity);
-            _stprintf(buf, _T("%d%%"), Config::opacity);
+            FormatTo(buf, _T("%d%%"), Config::opacity);
             StyleControl(MK(_T("STATIC"), buf, SS_CENTERIMAGE, LCX + 124, y, 52, H, ID_STATIC_OPACITY_VAL));
 
             int leftBottom = y + GAP;
@@ -1610,7 +1652,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             HWND hTrack = MK(TRACKBAR_CLASS, _T(""), WS_TABSTOP, RCX - 4, y, 108, 28, ID_TRACK_ANIM_SPEED);
             SendMessage(hTrack, TBM_SETRANGE, TRUE, MAKELPARAM(0, 20));
             SendMessage(hTrack, TBM_SETPOS, TRUE, Config::animDuration / 100);
-            _stprintf(buf, _T("%.1fs"), Config::animDuration / 1000.0);
+            FormatTo(buf, _T("%.1fs"), Config::animDuration / 1000.0);
             StyleControl(MK(_T("STATIC"), buf, SS_CENTERIMAGE, RCX + 108, y, 52, H, ID_STATIC_DURATION_VAL));
 
             y += GAP + 8;
@@ -1658,10 +1700,10 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             y += GAP;
             // Offsets — allow negative & float (no ES_NUMBER)
             LABEL(L(S_OFFSET_X), RX, y, RLW);
-            _stprintf(buf, _T("%.1f"), Config::offsetX);
+            FormatTo(buf, _T("%.1f"), Config::offsetX);
             SetWindowText(EDIT(RCX, y, 60, ID_EDIT_OFFSET_X), buf);
             LABEL(L(S_OFFSET_Y), RCX + 66, y, 20);
-            _stprintf(buf, _T("%.1f"), Config::offsetY);
+            FormatTo(buf, _T("%.1f"), Config::offsetY);
             SetWindowText(EDIT(RCX + 92, y, 60, ID_EDIT_OFFSET_Y), buf);
 
             int rightBottom = y + GAP;
@@ -1823,17 +1865,17 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
              TCHAR valBuf[16];
              if ((HWND)lParam == GetDlgItem(hwnd, ID_TRACK_ANIM_SPEED)) {
                  int pos = SendMessage((HWND)lParam, TBM_GETPOS, 0, 0);
-                 _stprintf(valBuf, _T("%.1fs"), pos / 10.0);
+                 FormatTo(valBuf, _T("%.1fs"), pos / 10.0);
                  SetWindowText(GetDlgItem(hwnd, ID_STATIC_DURATION_VAL), valBuf);
                  if (g_settingsReady) ApplyPreview(hwnd);
              } else if ((HWND)lParam == GetDlgItem(hwnd, ID_TRACK_OPACITY)) {
                  int pos = SendMessage((HWND)lParam, TBM_GETPOS, 0, 0);
-                 _stprintf(valBuf, _T("%d%%"), pos);
+                 FormatTo(valBuf, _T("%d%%"), pos);
                  SetWindowText(GetDlgItem(hwnd, ID_STATIC_OPACITY_VAL), valBuf);
                  if (g_settingsReady) ApplyPreview(hwnd);
              } else if ((HWND)lParam == GetDlgItem(hwnd, ID_TRACK_FXPOWER)) {
                  int pos = SendMessage((HWND)lParam, TBM_GETPOS, 0, 0);
-                 _stprintf(valBuf, _T("%d%%"), pos);
+                 FormatTo(valBuf, _T("%d%%"), pos);
                  SetWindowText(GetDlgItem(hwnd, ID_STATIC_FXPOWER_VAL), valBuf);
                  if (g_settingsReady) ApplyPreview(hwnd);
              }
@@ -1978,14 +2020,14 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                     lstrcpyW(tempFontName, Defaults::fontName);
 
                     TCHAR buf[32];
-                    _stprintf(buf, _T("%.1f"), Defaults::fontSize);
+                    FormatTo(buf, _T("%.1f"), Defaults::fontSize);
                     SetWindowText(GetDlgItem(hwnd, ID_EDIT_FONT_SIZE), buf);
 
-                    _stprintf(buf, _T("%.1f"), Defaults::outlineWidth);
+                    FormatTo(buf, _T("%.1f"), Defaults::outlineWidth);
                     SetWindowText(GetDlgItem(hwnd, ID_EDIT_OUTLINE_WIDTH), buf);
 
                     SendMessage(GetDlgItem(hwnd, ID_TRACK_ANIM_SPEED), TBM_SETPOS, TRUE, Defaults::animDuration / 100);
-                    _stprintf(buf, _T("%.1fs"), Defaults::animDuration / 1000.0);
+                    FormatTo(buf, _T("%.1fs"), Defaults::animDuration / 1000.0);
                     SetWindowText(GetDlgItem(hwnd, ID_STATIC_DURATION_VAL), buf);
 
                     SetWindowText(GetDlgItem(hwnd, ID_EDIT_OFFSET_X), _T("0.0"));
@@ -2002,11 +2044,11 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                     SendMessage(GetDlgItem(hwnd, ID_COMBO_MONITOR), CB_SETCURSEL, 0, 0); // Auto
 
                     SendMessage(GetDlgItem(hwnd, ID_TRACK_FXPOWER), TBM_SETPOS, TRUE, Defaults::fxIntensity);
-                    _stprintf(buf, _T("%d%%"), Defaults::fxIntensity);
+                    FormatTo(buf, _T("%d%%"), Defaults::fxIntensity);
                     SetWindowText(GetDlgItem(hwnd, ID_STATIC_FXPOWER_VAL), buf);
 
                     SendMessage(GetDlgItem(hwnd, ID_TRACK_OPACITY), TBM_SETPOS, TRUE, Defaults::opacity);
-                    _stprintf(buf, _T("%d%%"), Defaults::opacity);
+                    FormatTo(buf, _T("%d%%"), Defaults::opacity);
                     SetWindowText(GetDlgItem(hwnd, ID_STATIC_OPACITY_VAL), buf);
 
                     SetWindowText(GetDlgItem(hwnd, ID_STATIC_FONT_NAME), tempFontName);
@@ -2144,12 +2186,13 @@ void DoSettingsDialog(HWND parent) {
 void StartSlide(HWND hwnd, AnimState newState) {
     currentState = newState;
 
-    // Coming back into view: the cached surface still holds whatever the time
-    // was when we hid, and no text timer ran while hidden. Redraw NOW rather
-    // than arming a timer — arming alone was the old behaviour and it meant the
+    // Coming back into view: the window still holds whatever the time was
+    // when we hid, and no text timer ran while hidden. Redraw NOW rather than
+    // arming a timer — arming alone was the old behaviour and it meant the
     // clock slid in showing a stale minute for up to a full minute.
-    // RefreshClockText is a no-op when the text has not actually changed, so a
-    // quick hover in and out still costs no GDI+ work.
+    // RefreshClockText is a no-op when the text has not actually changed, so
+    // a hover or taskbar raise — even one long enough to park — costs no GDI+
+    // work on the way back in.
     if (newState == STATE_SLIDING_UP) {
         RefreshClockText(hwnd);
         ArmClockTimer(hwnd); // Resume boundary ticks (killed while hidden)
@@ -2214,6 +2257,8 @@ void ArmClockTimer(HWND hwnd) {
 HWND g_hwndMain = NULL;
 HWINEVENTHOOK g_hookForeground = NULL;
 HWINEVENTHOOK g_hookTaskbar = NULL;
+bool  g_trayHookPaused = false; // Taskbar hook lifted while the pointer moves over the bar
+POINT g_pausedAt = { 0, 0 };    // Pointer position at the last paused-state check
 
 void EvaluateVisibility(HWND hwnd); // fwd decl
 
@@ -2279,8 +2324,9 @@ bool TrayCoversClock(RECT rcTray) {
     return IntersectRect(&rcHit, &rcTray, &rcOnScreen) != FALSE;
 }
 
-// Picks the safety-net interval: snappy when the cursor is near the clock,
-// relaxed otherwise, and slowest of all while the clock is already hidden.
+// Picks the safety-net interval: snappy when the cursor is near the clock (or
+// the taskbar hook is paused, so this timer is what watches the bar), relaxed
+// otherwise, and slowest of all while the clock is already hidden.
 void ArmLogicTimer(HWND hwnd) {
     UINT interval;
     POINT pt;
@@ -2289,7 +2335,7 @@ void ArmLogicTimer(HWND hwnd) {
         int x = ClockX(), y = targetY;
         int dx = (pt.x < x) ? x - pt.x : (pt.x > x + clockSize.cx ? pt.x - x - clockSize.cx : 0);
         int dy = (pt.y < y) ? y - pt.y : (pt.y > y + clockSize.cy ? pt.y - y - clockSize.cy : 0);
-        bool nearClock = (dx < NEAR_PX && dy < NEAR_PX);
+        bool nearClock = (dx < NEAR_PX && dy < NEAR_PX) || g_trayHookPaused;
         interval = nearClock ? 120 : (currentState == STATE_HIDDEN ? 1000 : 500);
     } else {
         interval = 500;
@@ -2359,18 +2405,25 @@ void EvaluateVisibility(HWND hwnd) {
         // monitor: a fullscreen video on another display has nothing to hide
         // from, and the global shell state used to hide the clock everywhere.
         //
-        // The expensive parts (the shell query is cross-process, the z-order
-        // walk touches every top-level window) run only when the foreground
-        // window changed or every 5th tick, to catch in-place F11 toggles.
+        // The expensive parts (the shell query is cross-process: 54 us and 1.5
+        // context switches measured; the z-order walk touches every top-level
+        // window) run only when the foreground window changed, or on every 5th
+        // evaluation AND at least 2.5 s after the last run, to catch in-place
+        // F11 toggles. The time gate matters: evaluations also come from the
+        // 120 ms near-cursor cadence and from taskbar LOCATIONCHANGE bursts,
+        // which used to multiply a plain "every 5th call" to every 600 ms.
         if (!shouldHide) {
             static HWND s_lastFore = NULL;
             static int s_slowTick = 0;
+            static ULONGLONG s_lastSlow = 0;
             static bool s_slowHide = false;
 
             HWND hFore = GetForegroundWindow();
-            if (hFore != s_lastFore || ++s_slowTick >= 5) {
+            ULONGLONG now = GetTickCount64();
+            if (hFore != s_lastFore || (++s_slowTick >= 5 && now - s_lastSlow >= 2500)) {
                 s_lastFore = hFore;
                 s_slowTick = 0;
+                s_lastSlow = now;
                 s_slowHide = false;
 
                 QUERY_USER_NOTIFICATION_STATE quns;
@@ -2414,26 +2467,13 @@ void EvaluateVisibility(HWND hwnd) {
 }
 
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
-                           LONG idObject, LONG, DWORD, DWORD) {
-    if (!g_hwndMain) return;
-    // LOCATIONCHANGE also fires for carets and the mouse cursor; only whole
-    // windows moving can uncover or cover the clock.
-    if (event == EVENT_OBJECT_LOCATIONCHANGE && (idObject != OBJID_WINDOW || !hwnd)) return;
-    EvaluateVisibility(g_hwndMain);
-}
+                           LONG idObject, LONG, DWORD, DWORD);
 
 // The taskbar hook is scoped to explorer's tray thread so we are not woken by
-// every window move on the system.
-void InstallVisibilityHooks(HWND hwnd) {
-    g_hwndMain = hwnd;
-
-    if (!g_hookForeground) {
-        g_hookForeground = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
-                                          NULL, WinEventProc, 0, 0,
-                                          WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    }
-
+// every window move on the system. (Re)installing it also ends any pause.
+static void HookTray() {
     if (g_hookTaskbar) { UnhookWinEvent(g_hookTaskbar); g_hookTaskbar = NULL; }
+    g_trayHookPaused = false;
     HWND hTray = FindWindow(_T("Shell_TrayWnd"), NULL);
     if (hTray) {
         DWORD pid = 0;
@@ -2444,9 +2484,63 @@ void InstallVisibilityHooks(HWND hwnd) {
     }
 }
 
+// That hook also gets a cursor event for every pointer move over a taskbar
+// window: cursor events are attributed to the thread under the pointer, and no
+// hook filter can exclude them. Measured: 60-125 moves/s over the bar cost the
+// clock 5.5-12 Mcycles/s, 10-25x its idle rate, all for events thrown away
+// unread. So the first one lifts the hook, and the logic timer (at the snappy
+// cadence meanwhile) watches the bar and puts the hook back once the pointer
+// rests. UnhookWinEvent from inside the callback is fine: it must be called on
+// the installing thread, which is where out-of-context callbacks run.
+static void PauseTrayHook() {
+    if (!g_hookTaskbar) return; // Already paused; a queued event from the old hook
+    UnhookWinEvent(g_hookTaskbar);
+    g_hookTaskbar = NULL;
+    g_trayHookPaused = true;
+    GetCursorPos(&g_pausedAt);
+    ArmLogicTimer(g_hwndMain);
+}
+
+// Called on every logic tick. Still moving: stay paused (each tick evaluates
+// the bar anyway). At rest since the last tick: listen again — no more cursor
+// events can come until it moves, and the next move pauses again.
+static void ResumeTrayHookIfIdle() {
+    if (!g_trayHookPaused) return;
+    POINT pt;
+    if (GetCursorPos(&pt) && (pt.x != g_pausedAt.x || pt.y != g_pausedAt.y)) {
+        g_pausedAt = pt;
+        return;
+    }
+    HookTray();
+}
+
+void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
+                           LONG idObject, LONG, DWORD, DWORD) {
+    if (!g_hwndMain) return;
+    if (event == EVENT_OBJECT_LOCATIONCHANGE) {
+        if (idObject == OBJID_CURSOR) { PauseTrayHook(); return; }
+        // Carets etc. also report LOCATIONCHANGE; only whole windows moving
+        // can uncover or cover the clock.
+        if (idObject != OBJID_WINDOW || !hwnd) return;
+    }
+    EvaluateVisibility(g_hwndMain);
+}
+
+void InstallVisibilityHooks(HWND hwnd) {
+    g_hwndMain = hwnd;
+
+    if (!g_hookForeground) {
+        g_hookForeground = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                                          NULL, WinEventProc, 0, 0,
+                                          WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+    HookTray();
+}
+
 void RemoveVisibilityHooks() {
     if (g_hookForeground) { UnhookWinEvent(g_hookForeground); g_hookForeground = NULL; }
     if (g_hookTaskbar) { UnhookWinEvent(g_hookTaskbar); g_hookTaskbar = NULL; }
+    g_trayHookPaused = false;
     g_hwndMain = NULL;
 }
 
@@ -2620,7 +2714,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         }
         if (wParam == 3) { // Animation Timer
             bool animating = false;
-            bool parked = false; // Slide-down just finished; release after presenting
+            bool parked = false; // Slide-down just finished; trim after presenting
 
             // TIME-BASED ANIMATION with ease-out cubic.
             // Progress derives from wall-clock elapsed time, so the slide
@@ -2680,13 +2774,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                              Config::opacity * g_animAlpha / 100);
             }
 
-            // Strictly after the present above: FreeSurface() first would turn
-            // that PresentClock into a no-op and strand the clock one frame
-            // short of hidden.
+            // Parked. Frames never read the DIB, so freeing it can no longer
+            // strand the last frame, and the window keeps its bitmap: leave
+            // g_lastRendered alone, and the way back in only redraws if the
+            // text changed meanwhile.
             if (parked) {
                 ArmClockTimer(hwnd); // Hidden — stops the text timer entirely
-                FreeSurface();       // The DIB is the bulk of the idle footprint
-                g_lastRendered[0] = _T('\0');
+                FreeSurface();       // Rebuilt by the next render, if any
                 SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
             }
             return 0;
@@ -2702,6 +2796,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         }
 
         if (wParam == 1) { // Visibility safety net
+            ResumeTrayHookIfIdle(); // Before evaluating, so nothing falls in a gap
             EvaluateVisibility(hwnd);
             // EvaluateVisibility stops the timer once the clock is parked by the
             // user; re-arming unconditionally here would defeat that.
