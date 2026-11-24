@@ -12,8 +12,6 @@
 #include <locale.h>
 #include <gdiplus.h>
 #include <shellapi.h>
-#include <shobjidl.h>
-#include <shlguid.h>
 #include <shlobj.h>
 #include <objbase.h>
 #include <commctrl.h>

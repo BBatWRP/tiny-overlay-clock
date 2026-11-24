@@ -4,7 +4,7 @@
 EdgeClock is a lightweight, single-file Win32 desktop clock application written in C++. It displays the current time (HH:MM) in the bottom-right corner of the screen with a transparent, outlined text overlay. The clock auto-hides when fullscreen apps are detected or the taskbar is raised, using smooth slide animations.
 
 ## Architecture
-This is a **single-file Win32 application** (`EdgeClock.cpp`, ~2,500 lines). All logic resides in one `.cpp` file with no external dependencies beyond the Windows SDK and GDI+.
+This is a **single-file Win32 application** (`EdgeClock.cpp`, ~3,100 lines). All logic resides in one `.cpp` file with no external dependencies beyond the Windows SDK and GDI+.
 
 ### Key Components
 Line numbers drift with every change — search for the name instead.
@@ -171,7 +171,7 @@ with CRLF endings: a UTF-8 em dash in a `REM` line once made `cmd` print
 - **Layered Window**: Uses `WS_EX_LAYERED | WS_EX_TRANSPARENT` for click-through transparent overlay
 - **GDI+ GraphicsPath**: Text rendered as outlined path (not plain DrawString) for border effect
 - **Single Instance**: Uses a named mutex `EdgeClock_GlobalInstance_Mutex`
-- **RAM Trimming**: Calls `SetProcessWorkingSetSize(-1, -1)` after init and each minute redraw
+- **RAM Trimming**: Calls `SetProcessWorkingSetSize(-1, -1)` after init, each minute redraw, and when the clock parks hidden
 
 ## Known Issues / Limitations
 - Font weight is limited to the styles GDI+ exposes (Regular/Bold/Italic/Bold Italic); Light/Thin requires picking a separate family such as "Segoe UI Light"

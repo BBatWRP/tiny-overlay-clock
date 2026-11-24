@@ -22,7 +22,7 @@ EdgeClock blends seamlessly into your desktop environment, providing time withou
 * **Extreme Efficiency**:
   * Integrates with Windows EcoQoS to minimize CPU impact and battery drain.
   * Wakes only on the second/minute boundary the display can actually change on — not on a fixed poll.
-  * Animation re-presents a cached surface instead of re-rendering, so sliding and fading cost no drawing work.
+  * Animation only moves and fades the picture the window already holds, so sliding and fading cost no drawing work.
   * While hidden it stops keeping time altogether — there is nothing on screen to keep current, so the clock redraws on the way back into view instead, and only if the time moved on. Hidden by the tray menu, it runs **no timers at all** and sleeps until you ask for it back.
   * Returns its memory to the OS immediately after every redraw, and releases the render surface itself while hidden, so the resident set sits around **0.8 MB**, private memory under **3 MB**, and the whole executable is only 95 KB.
   * Loads just the one font file it draws with instead of indexing every installed font, and re-shows itself after a hide without redrawing when the time has not changed.
@@ -68,7 +68,7 @@ graph TD
     I -- Area Clear --> M[Trigger Slide Up]
     
     L --> S[Park: stop clock timer \n free surface]
-    M --> T[Redraw before it is seen]
+    M --> T[Redraw only if the time changed]
     
     K --> N[SetProcessWorkingSetSize \n Trim RAM]
     
