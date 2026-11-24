@@ -4,7 +4,7 @@
 ; so this keeps upgrades replacing existing installs instead of duplicating.
 AppId=EdgeClock
 AppName=EdgeClock
-AppVersion=1.7.3.0
+AppVersion=1.8.0.0
 ; No AppMutex: it is checked before the wizard even opens and only offers
 ; "close it yourself, then OK" (a silent install just aborts). Instead the
 ; [Code] section closes a running clock once the user commits to installing
@@ -15,7 +15,7 @@ RestartApplications=no
 DefaultDirName={autopf}\EdgeClock
 DefaultGroupName=EdgeClock
 OutputDir=Output
-OutputBaseFilename=EdgeClockSetup_v1.7.3
+OutputBaseFilename=EdgeClockSetup_v1.8.0
 Compression=lzma2
 SolidCompression=yes
 SetupIconFile=clock_23989.ico

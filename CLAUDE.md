@@ -73,7 +73,7 @@ warning that appears is new and worth reading.
 | `-ffunction-sections -fdata-sections -Wl,--gc-sections -s` | Discards unreferenced code and symbols. |
 
 Exe size across the three steps: **688 KB → 270 KB → 166 KB** (−76%).
-v1.7.3 measured 123,392 bytes; v1.8 is 92,672 (printf engine removed, see below).
+v1.7.3 measured 123,392 bytes; v1.8 is 94,720 (printf engine removed, see below).
 
 **printf family: msvcrt forms only.** libstdc++'s `os_defines.h` forces
 `__USE_MINGW_ANSI_STDIO=1` (`-D...=0` is a no-op), which routes `fprintf` and the
@@ -105,13 +105,18 @@ switches, of which ~2 are the platform floor for any timer wakeup on this
 machine; the clock's own per-tick work is a few µs. Active use dominates:
 slides, hide/show cycles and pointer motion over the taskbar (see v1.8).
 
-**Untried, measured opportunity:** `new FontFamily(name)` makes GDI+ enumerate
-every installed font (~1,100 here): ~85 ms warm / ~1.1 s cold at startup and
-~1.4 MB commit that is never released. A `PrivateFontCollection` with only the
-configured face file costs ~5–10 ms and ~0.5 MB. Glyph fallback still works (GDI+
-builds the full table then, same cost as today). Needs name+weight → file
-resolution (DirectWrite GDI interop) and must keep `FontStyleFor`'s style
-fallback — about 60 lines; not done yet.
+**Font loading (v1.8):** `new FontFamily(name)` makes GDI+ enumerate every
+installed font (~1,100 here): ~85 ms warm / ~1.1 s cold at startup and ~1.4 MB
+commit never released. `GetFontFamily` now loads only the configured face file
+into a `PrivateFontCollection` (`FindFaceFile`: DirectWrite GDI interop, dwrite
+via GetProcAddress) when that exact face exists — same GDI family name, weight
+and slant, no simulation, one local file — else it falls back to the installed
+collection exactly as before. `FontStyleFor` skips `IsStyleAvailable` for the
+private family (it would claim every style). Verified: 13 fonts × 4 weights ×
+digits/Thai = 104 outline comparisons against the old path, 0 differ. Glyph
+fallback still works (GDI+ then builds the full index itself, today's cost).
+Measured: first family 9 ms / +540 KB; live private bytes 4.3 → 2.9 MB, peak
+WS 18.8 → 14.4 MB.
 
 **Rejected after measurement:** shutting GDI+ down between renders
 (`GdiplusShutdown` + restart per minute). It saved only ~90 KB — the trim already
@@ -394,9 +399,10 @@ never produced cursor events (verified).
 `SHQueryUserNotificationState` (54 us + 1.5 context switches) also counted
 120 ms ticks and taskbar event bursts, so it ran every 600 ms near the clock. Now 5th call AND >= 2.5 s.
 
-**Exe 123,392 -> 92,672 bytes** (printf engine removed; the icon adds 4.6 KB),
-**WIC no longer loaded** (icon small frames as DIB). Private bytes of a fresh
-start 4.7-5.2 MB -> 4.36 MB.
+**Exe 123,392 -> 94,720 bytes** (printf engine removed; the icon adds 4.6 KB,
+font loading 2 KB), **WIC no longer loaded** (icon small frames as DIB), **one
+font file loaded instead of the installed-font index** (see Memory strategy).
+Private bytes of a fresh start 4.3-5.2 MB -> 2.9 MB; peak WS 18.8 -> 14.4 MB.
 
 **Checked and rejected:** SetCoalescableTimer on timer 1 (no fewer wakeups);
 ABN_FULLSCREENAPP appbar instead of SHQUNS (same signal as the rect checks,

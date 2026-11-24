@@ -23,8 +23,9 @@ EdgeClock blends seamlessly into your desktop environment, providing time withou
   * Integrates with Windows EcoQoS to minimize CPU impact and battery drain.
   * Wakes only on the second/minute boundary the display can actually change on — not on a fixed poll.
   * Animation re-presents a cached surface instead of re-rendering, so sliding and fading cost no drawing work.
-  * While hidden it stops keeping time altogether — there is nothing on screen to keep current, so the clock redraws on the way back into view instead. Hidden by the tray menu, it runs **no timers at all** and sleeps until you ask for it back.
-  * Returns its memory to the OS immediately after every redraw, and releases the render surface itself while hidden, so the resident set sits around **0.8 MB** and the whole executable is only 120 KB.
+  * While hidden it stops keeping time altogether — there is nothing on screen to keep current, so the clock redraws on the way back into view instead, and only if the time moved on. Hidden by the tray menu, it runs **no timers at all** and sleeps until you ask for it back.
+  * Returns its memory to the OS immediately after every redraw, and releases the render surface itself while hidden, so the resident set sits around **0.8 MB**, private memory under **3 MB**, and the whole executable is only 95 KB.
+  * Loads just the one font file it draws with instead of indexing every installed font, and re-shows itself after a hide without redrawing when the time has not changed.
   * Measured against v1.5: **~60% less CPU and ~90% less memory** while idle.
 * **Modern Settings Interface**: A dark-themed configuration dialog that opens on the monitor you're using, scales correctly at any display scaling, and works fully from the keyboard.
 * **Fully Customizable**:
@@ -84,7 +85,7 @@ graph TD
 
 **Option 1: Windows Installer (Recommended)**
 1. Navigate to the [Releases](https://github.com/BBatWRP/tiny-overlay-clock/releases) page.
-2. Download `EdgeClockSetup_v1.7.2.exe` (or the newest `EdgeClockSetup_v*.exe`).
+2. Download `EdgeClockSetup_v1.8.0.exe` (or the newest `EdgeClockSetup_v*.exe`).
 3. Follow the installation wizard. Upgrading? Just run it: the installer closes a running EdgeClock, updates it in place, starts it again, and keeps your settings.
 
 **Option 2: Portable Executable**

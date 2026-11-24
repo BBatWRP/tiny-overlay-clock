@@ -20,6 +20,7 @@
 #include <commdlg.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
+#include <dwrite.h> // Interfaces only; dwrite.dll is reached via GetProcAddress
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -553,13 +554,108 @@ float EffectPad() {
 // --- Cached GDI+ font family -------------------------------------------------
 // Constructing a FontFamily hits the font table each time; the clock re-renders
 // on every minute tick and on every keystroke during live preview, so the
-// family is cached and only rebuilt when the configured name changes.
+// family is cached and only rebuilt when the configured name or style changes.
+//
+// It is loaded from a one-file PrivateFontCollection when possible: the first
+// FontFamily(name) against the installed collection makes GDI+ index every
+// installed font (~1,100 here) — measured ~85 ms warm / ~1.1 s cold at startup
+// and ~1.4 MB of commit never released. The one-file route costs ~5-10 ms and
+// ~0.5 MB. Glyphs missing from the face still fall back to other fonts (GDI+
+// then builds the full index itself, i.e. today's cost, no regression).
 FontFamily* g_pFamily = NULL;
+PrivateFontCollection* g_pfc = NULL;
 WCHAR g_familyCached[32] = L"";
+INT   g_familyStyle = -1;
+bool  g_familyExact = false; // g_pFamily holds exactly the requested face
 
 void FreeFontCache() {
     if (g_pFamily) { delete g_pFamily; g_pFamily = NULL; }
+    if (g_pfc) { delete g_pfc; g_pfc = NULL; }
     g_familyCached[0] = L'\0';
+    g_familyStyle = -1;
+    g_familyExact = false;
+}
+
+// Config::fontWeight as a GDI+ FontStyle.
+INT RequestedStyle() {
+    switch (Config::fontWeight) {
+        case 0:  return FontStyleRegular;
+        case 2:  return FontStyleItalic;
+        case 3:  return FontStyleBoldItalic;
+        default: return FontStyleBold;
+    }
+}
+
+template <class T> static void ReleaseCom(T*& p) { if (p) { p->Release(); p = NULL; } }
+
+// Path of the font file GDI would use for (name, style) — but only when that
+// face really exists: same GDI family name, the requested weight and slant, no
+// simulated bold/italic, one local file. Anything else returns false and the
+// caller keeps the installed-collection behaviour. DirectWrite's GDI interop
+// does the mapping, so GDI family names ("Segoe UI Light") and per-user fonts
+// resolve correctly. dwrite.dll is loaded by gdiplus.dll anyway.
+static bool FindFaceFile(const WCHAR* name, INT style, WCHAR* path, UINT32 cap) {
+    typedef HRESULT (WINAPI *CreateFn)(DWRITE_FACTORY_TYPE, REFIID, IUnknown**);
+    HMODULE dw = LoadLibraryExW(L"dwrite.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!dw) return false;
+    CreateFn create = (CreateFn)(void*)GetProcAddress(dw, "DWriteCreateFactory");
+
+    IDWriteFactory* factory = NULL;
+    IDWriteGdiInterop* interop = NULL;
+    IDWriteFont* font = NULL;
+    IDWriteLocalizedStrings* names = NULL;
+    IDWriteFontFace* face = NULL;
+    IDWriteFontFile* file = NULL;
+    IDWriteFontFileLoader* loader = NULL;
+    IDWriteLocalFontFileLoader* local = NULL;
+
+    LOGFONTW lf;
+    ZeroMemory(&lf, sizeof(lf));
+    lstrcpynW(lf.lfFaceName, name, LF_FACESIZE);
+    lf.lfWeight = (style & FontStyleBold) ? FW_BOLD : FW_NORMAL;
+    lf.lfItalic = (style & FontStyleItalic) ? TRUE : FALSE;
+    lf.lfCharSet = DEFAULT_CHARSET;
+
+    bool ok = create &&
+        SUCCEEDED(create(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)&factory)) &&
+        SUCCEEDED(factory->GetGdiInterop(&interop)) &&
+        SUCCEEDED(interop->CreateFontFromLOGFONT(&lf, &font)) &&
+        font->GetSimulations() == DWRITE_FONT_SIMULATIONS_NONE &&
+        (font->GetWeight() >= DWRITE_FONT_WEIGHT_SEMI_BOLD) == ((style & FontStyleBold) != 0) &&
+        (font->GetStyle() != DWRITE_FONT_STYLE_NORMAL) == ((style & FontStyleItalic) != 0);
+
+    // GDI substitutes a different family for an unknown name; insist on ours
+    if (ok) {
+        BOOL exists = FALSE;
+        ok = SUCCEEDED(font->GetInformationalStrings(DWRITE_INFORMATIONAL_STRING_WIN32_FAMILY_NAMES,
+                                                     &names, &exists)) && exists && names;
+        if (ok) {
+            ok = false;
+            WCHAR fam[LF_FACESIZE];
+            for (UINT32 i = 0, n = names->GetCount(); i < n && !ok; i++) {
+                UINT32 len = 0;
+                if (SUCCEEDED(names->GetStringLength(i, &len)) && len < LF_FACESIZE &&
+                    SUCCEEDED(names->GetString(i, fam, LF_FACESIZE)))
+                    ok = lstrcmpiW(fam, name) == 0;
+            }
+        }
+    }
+
+    UINT32 nFiles = 1, keySize = 0, len = 0;
+    const void* key = NULL;
+    ok = ok &&
+        SUCCEEDED(font->CreateFontFace(&face)) &&
+        SUCCEEDED(face->GetFiles(&nFiles, &file)) && nFiles == 1 && file &&
+        SUCCEEDED(file->GetReferenceKey(&key, &keySize)) &&
+        SUCCEEDED(file->GetLoader(&loader)) &&
+        SUCCEEDED(loader->QueryInterface(__uuidof(IDWriteLocalFontFileLoader), (void**)&local)) &&
+        SUCCEEDED(local->GetFilePathLengthFromKey(key, keySize, &len)) && len < cap &&
+        SUCCEEDED(local->GetFilePathFromKey(key, keySize, path, cap));
+
+    ReleaseCom(local); ReleaseCom(loader); ReleaseCom(file); ReleaseCom(face);
+    ReleaseCom(names); ReleaseCom(font); ReleaseCom(interop); ReleaseCom(factory);
+    FreeLibrary(dw);
+    return ok;
 }
 
 // --- Why GDI+ stays initialised ---------------------------------------------
@@ -578,9 +674,31 @@ void GdiplusEnsure() {
 }
 
 FontFamily* GetFontFamily() {
-    if (g_pFamily && wcscmp(g_familyCached, Config::fontName) == 0) return g_pFamily;
+    INT style = RequestedStyle();
+    if (g_pFamily && g_familyStyle == style && wcscmp(g_familyCached, Config::fontName) == 0)
+        return g_pFamily;
 
     FreeFontCache();
+    lstrcpynW(g_familyCached, Config::fontName, 32);
+    g_familyStyle = style;
+
+    // Exact face from its own file (see above), else the installed collection
+    WCHAR path[MAX_PATH];
+    if (FindFaceFile(Config::fontName, style, path, MAX_PATH)) {
+        g_pfc = new PrivateFontCollection();
+        if (g_pfc->AddFontFile(path) == Ok) {
+            g_pFamily = new FontFamily(Config::fontName, g_pfc);
+            if (g_pFamily->GetLastStatus() == Ok && g_pFamily->IsStyleAvailable(style)) {
+                g_familyExact = true;
+                return g_pFamily;
+            }
+            delete g_pFamily;
+            g_pFamily = NULL;
+        }
+        delete g_pfc;
+        g_pfc = NULL;
+    }
+
     g_pFamily = new FontFamily(Config::fontName);
     if (g_pFamily->GetLastStatus() != Ok) {
         delete g_pFamily;
@@ -590,20 +708,17 @@ FontFamily* GetFontFamily() {
             g_pFamily = new FontFamily(L"Arial");
         }
     }
-    lstrcpynW(g_familyCached, Config::fontName, 32);
     return g_pFamily;
 }
 
 // Maps Config::fontWeight to a GDI+ FontStyle, falling back to a style the
-// family actually ships (many fonts have no italic or no bold face).
+// family actually ships (many fonts have no italic or no bold face). A
+// one-file private family is the requested face by construction — and its
+// IsStyleAvailable would claim every style (GDI+ would synthesise them) — so
+// it skips the check.
 INT FontStyleFor(FontFamily* fam) {
-    INT style;
-    switch (Config::fontWeight) {
-        case 0:  style = FontStyleRegular; break;
-        case 2:  style = FontStyleItalic; break;
-        case 3:  style = FontStyleBoldItalic; break;
-        default: style = FontStyleBold; break;
-    }
+    INT style = RequestedStyle();
+    if (g_familyExact && fam == g_pFamily) return style;
     if (fam && !fam->IsStyleAvailable(style)) {
         if (fam->IsStyleAvailable(FontStyleRegular)) return FontStyleRegular;
         if (fam->IsStyleAvailable(FontStyleBold)) return FontStyleBold;
